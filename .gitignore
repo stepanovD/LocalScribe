@@ -1,0 +1,37 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# CMake and native builds
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Xcode user state
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Local application artifacts
+Build/
+dist/
+*.app/
+*.dSYM/
+*.db
+*.db-shm
+*.db-wal
+
+# Local inference models and captured media
+Models/
+*.bin
+*.gguf
+*.wav
+*.m4a
+*.mp3
+*.mp4
+
+# macOS
+.DS_Store
