@@ -15,19 +15,25 @@ final class AppModel: ObservableObject {
     @Published private(set) var voiceProfiles: [CoreVoiceProfile] = []
     @Published private(set) var voiceProfileFailure: String?
     @Published private(set) var isVoiceProfileOperationInProgress = false
+    @Published private(set) var detectedCallProposal: DetectedCallProposal?
 
     private let directoryStore: SecurityScopedDirectoryStore
     private let modelStore: SecurityScopedModelStore
     private let controller: SessionController?
+    private let callDetectionMonitor: CallDetectionMonitor
     private let consentIssuer = VisibleConsentIssuer()
     private var updatesTask: Task<Void, Never>?
+    private var callDetectionUpdatesTask: Task<Void, Never>?
+    private var callDetectionOfferLedger = CallDetectionOfferLedger()
     private var voiceProfileRefreshGeneration = LatestRequestGeneration()
 
     init() {
         let directoryStore = SecurityScopedDirectoryStore()
         let modelStore = SecurityScopedModelStore()
+        let callDetectionMonitor = CallDetectionMonitor()
         self.directoryStore = directoryStore
         self.modelStore = modelStore
+        self.callDetectionMonitor = callDetectionMonitor
 
         let applicationSupport = URL.applicationSupportDirectory
             .appendingPathComponent("LocalScribe", isDirectory: true)
@@ -69,18 +75,23 @@ final class AppModel: ObservableObject {
         }
 
         beginObserving()
+        beginObservingCallDetection()
         Task {
             await controller?.recoverInterruptedSessions()
             await refreshSetupState()
+            await startCallDetectionIfAvailable()
         }
     }
 
     deinit {
         updatesTask?.cancel()
+        callDetectionUpdatesTask?.cancel()
     }
 
     var menuBarSymbol: String {
         switch session.state {
+        case .detected, .awaitingConsent:
+            "phone.badge.waveform"
         case .recording:
             "record.circle.fill"
         case .paused:
@@ -96,6 +107,8 @@ final class AppModel: ObservableObject {
 
     var menuBarTitle: String {
         switch session.state {
+        case .detected, .awaitingConsent:
+            "Call detected"
         case .recording:
             "Recording"
         case .paused:
@@ -109,6 +122,14 @@ final class AppModel: ObservableObject {
         default:
             "LocalScribe"
         }
+    }
+
+    var canStartRecording: Bool {
+        controller != nil && hasVaultSelection && hasModelSelection
+    }
+
+    var isRecordingEngineAvailable: Bool {
+        controller != nil
     }
 
     func requestManualStart() {
@@ -127,10 +148,32 @@ final class AppModel: ObservableObject {
 
     /// Called only by the visible, specifically labelled confirmation button.
     func confirmVisibleStart() {
+        confirmVisibleStart(expectedProposalID: detectedCallProposal?.id)
+    }
+
+    /// Called only by the Start button in the detected-call panel.
+    func confirmDetectedCallStart(proposalID: UUID) {
+        guard detectedCallProposal?.id == proposalID else {
+            return
+        }
+        confirmVisibleStart(expectedProposalID: proposalID)
+    }
+
+    private func confirmVisibleStart(expectedProposalID: UUID?) {
         guard let controller else {
             setupFailure = .coreUnavailable
             return
         }
+        guard canStartRecording else {
+            return
+        }
+        guard detectedCallProposal?.id == expectedProposalID else {
+            return
+        }
+
+        let acceptedProposal = detectedCallProposal
+        suppressActiveDetectedCalls()
+        detectedCallProposal = nil
 
         let now = Date()
         let filenameFormatter = DateFormatter()
@@ -142,16 +185,27 @@ final class AppModel: ObservableObject {
         titleFormatter.timeStyle = .short
 
         let token = consentIssuer.issue(for: .start)
+        let applicationName = acceptedProposal?.applicationName ?? "Manual"
+        let callName: String
+        if let acceptedProposal {
+            callName = "\(acceptedProposal.applicationName) Call"
+        } else {
+            callName = "Call"
+        }
         let request = SessionStartRequest(
-            sourceApplication: "Manual",
-            title: "Call \(titleFormatter.string(from: now))",
+            sourceApplication: applicationName,
+            title: "\(callName) \(titleFormatter.string(from: now))",
             preferredFilenameStem:
-                "\(filenameFormatter.string(from: now)) — Call",
+                "\(filenameFormatter.string(from: now)) — \(callName)",
             localSpeakerName: "Me",
             languageMode: .russianEnglish
         )
         Task {
-            await controller.start(after: token, request: request)
+            await controller.start(
+                after: token,
+                request: request,
+                expectedDetectedProposalID: expectedProposalID
+            )
             await refreshSetupState()
         }
     }
@@ -160,7 +214,20 @@ final class AppModel: ObservableObject {
         guard let controller else {
             return
         }
-        Task { await controller.dismissProposal() }
+        let proposalID = detectedCallProposal?.id
+        detectedCallProposal = nil
+        Task {
+            await controller.dismissProposal(
+                expectedDetectedProposalID: proposalID
+            )
+        }
+    }
+
+    func dismissDetectedCall(proposalID: UUID) {
+        guard detectedCallProposal?.id == proposalID else {
+            return
+        }
+        dismissStart()
     }
 
     func pause() {
@@ -193,6 +260,8 @@ final class AppModel: ObservableObject {
         }
         Task {
             await controller.recoverInterruptedSessions()
+            await refreshSetupState()
+            await startCallDetectionIfAvailable()
         }
     }
 
@@ -365,6 +434,10 @@ final class AppModel: ObservableObject {
     }
 
     func prepareForTermination() async {
+        callDetectionUpdatesTask?.cancel()
+        detectedCallProposal = nil
+        callDetectionOfferLedger.removeAll()
+        await callDetectionMonitor.stop()
         await controller?.prepareForTermination()
     }
 
@@ -406,11 +479,113 @@ final class AppModel: ObservableObject {
         }
         updatesTask = Task { [weak self] in
             for await value in controller.updates {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, let self else {
                     return
                 }
-                self?.session = value
+                self.session = value
+                if self.captureLifecycleOwnsCurrentCalls(value.state) {
+                    self.suppressActiveDetectedCalls()
+                } else {
+                    await self.offerPendingDetectedCallIfPossible()
+                }
             }
         }
+    }
+
+    private func beginObservingCallDetection() {
+        let events = callDetectionMonitor.events
+        callDetectionUpdatesTask = Task { [weak self] in
+            for await event in events {
+                guard !Task.isCancelled, let self else {
+                    return
+                }
+                await self.handleCallDetectionEvent(event)
+            }
+        }
+    }
+
+    private func startCallDetectionIfAvailable() async {
+        guard let controller else {
+            return
+        }
+        let snapshot = await controller.currentSnapshot()
+        guard snapshot.state != .recoveryRequired else {
+            return
+        }
+        await callDetectionMonitor.start()
+    }
+
+    private func handleCallDetectionEvent(
+        _ event: CallDetectionEvent
+    ) async {
+        guard let controller else {
+            return
+        }
+
+        switch event {
+        case let .began(proposal):
+            let shouldSuppress = captureLifecycleOwnsCurrentCalls(
+                session.state
+            )
+            callDetectionOfferLedger.observeBegan(
+                proposal,
+                suppress: shouldSuppress
+            )
+            if shouldSuppress {
+                return
+            }
+            await offerPendingDetectedCallIfPossible()
+
+        case let .ended(proposal):
+            callDetectionOfferLedger.observeEnded(proposal)
+            guard detectedCallProposal?.id == proposal.id else {
+                return
+            }
+            detectedCallProposal = nil
+            await controller.dismissProposal(
+                expectedDetectedProposalID: proposal.id
+            )
+        }
+    }
+
+    private func offerPendingDetectedCallIfPossible() async {
+        guard detectedCallProposal == nil, let controller else {
+            return
+        }
+
+        guard let proposal = callDetectionOfferLedger.nextOffer(),
+              callDetectionOfferLedger.reserve(proposal)
+        else {
+            return
+        }
+
+        // The reservation spans the actor hop. Rejected proposals are made
+        // eligible for a retry on the next shell-state change.
+        let accepted = await controller.proposeDetectedCall(id: proposal.id)
+        guard accepted else {
+            callDetectionOfferLedger.releaseRejectedReservation(proposal)
+            return
+        }
+
+        guard callDetectionOfferLedger.contains(proposal) else {
+            await controller.dismissProposal(
+                expectedDetectedProposalID: proposal.id
+            )
+            return
+        }
+        detectedCallProposal = proposal
+    }
+
+    private func suppressActiveDetectedCalls() {
+        callDetectionOfferLedger.suppressAllActive()
+    }
+
+    private func captureLifecycleOwnsCurrentCalls(
+        _ state: SessionShellState
+    ) -> Bool {
+        state == .preparing
+            || state == .recording
+            || state == .paused
+            || state == .finalizing
     }
 }

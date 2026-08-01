@@ -25,12 +25,18 @@ swiftc \
     "$project_root/macOS/Storage/StagingDirectory.swift" \
     "$project_root/macOS/Storage/VaultWriter.swift" \
     "$project_root/macOS/App/TerminationRequestCoordinator.swift" \
+    "$project_root/macOS/App/DetectedCallProposal.swift" \
+    "$project_root/macOS/System/CallDetectionModel.swift" \
+    "$project_root/macOS/System/SystemCallDetectionMonitor.swift" \
     "$project_root/macOS/Session/SessionController.swift" \
+    "$project_root/Tools/SwiftChecks/CallDetectionCheckSupport.swift" \
     "$project_root/Tools/SwiftChecks/RecoveryCheckSupport.swift" \
     "$project_root/Tools/SwiftChecks/LifecycleCheckSupport.swift" \
     "$project_root/Tools/SwiftChecks/main.swift" \
     -framework AVFoundation \
     -framework AudioToolbox \
+    -framework AppKit \
+    -framework CoreAudio \
     -framework CoreGraphics \
     -framework CoreMedia \
     -framework ScreenCaptureKit \

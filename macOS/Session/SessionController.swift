@@ -202,6 +202,7 @@ actor SessionController {
     private var startupRecoveryScanned = false
     private var startupRecoveryInProgress = false
     private var terminationRequested = false
+    private var pendingDetectedProposalID: UUID?
 
     init(
         coreClient: any CoreClientProtocol,
@@ -230,47 +231,60 @@ actor SessionController {
     }
 
     func proposeManualStart() throws {
-        guard session == nil,
+        guard !terminationRequested,
+              session == nil,
               startupRecoveryScanned,
-              snapshot.state == .idle
-                || snapshot.state == .detected
-                || snapshot.state == .failedToStart
-                || snapshot.state == .complete
-                || snapshot.state == .incompleteSources
-                || snapshot.state == .interrupted
+              canOfferStart(from: snapshot.state)
         else {
             throw SessionControllerError.invalidTransition
         }
+        pendingDetectedProposalID = nil
         update(state: .awaitingConsent, failure: nil)
     }
 
-    func proposeDetectedCall() {
-        guard startupRecoveryScanned, snapshot.state == .idle else {
-            return
+    @discardableResult
+    func proposeDetectedCall(id: UUID) -> Bool {
+        guard !terminationRequested,
+              session == nil,
+              startupRecoveryScanned,
+              canOfferStart(from: snapshot.state)
+        else {
+            return false
         }
+        pendingDetectedProposalID = id
         update(state: .detected, failure: nil)
+        update(state: .awaitingConsent, failure: nil)
+        return true
     }
 
-    func dismissProposal() {
+    func dismissProposal(expectedDetectedProposalID: UUID?) {
         guard snapshot.state == .awaitingConsent || snapshot.state == .detected else {
             return
         }
+        guard pendingDetectedProposalID == expectedDetectedProposalID else {
+            return
+        }
+        pendingDetectedProposalID = nil
         update(state: .idle, failure: nil)
     }
 
     func start(
         after token: ConsentToken,
-        request: SessionStartRequest
+        request: SessionStartRequest,
+        expectedDetectedProposalID: UUID? = nil
     ) async {
         await acquireLifecycleSlot()
         defer { releaseLifecycleSlot() }
 
         guard !terminationRequested,
               session == nil,
-              snapshot.state == .awaitingConsent
+              snapshot.state == .awaitingConsent,
+              pendingDetectedProposalID == expectedDetectedProposalID
         else {
             return
         }
+
+        pendingDetectedProposalID = nil
 
         do {
             try consume(token, expectedAction: .start)
@@ -559,6 +573,7 @@ actor SessionController {
     /// termination while ScreenCaptureKit is suspended in framework startup.
     func prepareForTermination() async {
         terminationRequested = true
+        pendingDetectedProposalID = nil
         cancelPublicationWorker()
         frameRouter.detach()
         intentionalCaptureStop = true
@@ -2175,6 +2190,15 @@ actor SessionController {
         activeCreatedAt = nil
         sourceUnavailableSince.removeAll()
         sourcesBeingRestarted.removeAll()
+    }
+
+    private func canOfferStart(from state: SessionShellState) -> Bool {
+        state == .idle
+            || state == .detected
+            || state == .failedToStart
+            || state == .complete
+            || state == .incompleteSources
+            || state == .interrupted
     }
 
     private func consume(

@@ -31,6 +31,9 @@ The implementation follows **LocalScribe Product Reference / PRD v0.4
 The repository contains one working macOS technical vertical:
 
 - SwiftUI/AppKit menu bar shell with a separate visible consent step;
+- metadata-only, debounced Zoom, Yandex Telemost, Google Meet, and Skype call
+  detection with a floating proposal panel that never starts capture
+  automatically;
 - independent ScreenCaptureKit system-audio and AVAudioEngine microphone
   adapters, with best-effort system voice processing on the microphone path
   plus grouped cross-source echo suppression when Whisper splits the same
@@ -79,10 +82,12 @@ In Settings, choose:
 1. the folder inside the Obsidian vault that should receive transcripts;
 2. the local multilingual ggml model.
 
-Choose **New transcript…**, read the separate consent screen, and press
-**Start Recording**. TCC prompts are requested only after that action. The app
-can then pause, explicitly resume, stop, show source health, and open the last
-published Markdown file.
+When LocalScribe detects a Zoom, Yandex Telemost, Google Meet, or Skype call,
+it shows a floating proposal with **Start Recording** and **Not Now**. You can
+always choose **New transcript…** manually instead. TCC prompts are requested
+only after the visible **Start Recording** action. The app can then pause,
+explicitly resume, stop, show source health, and open the last published
+Markdown file.
 
 On the first Screen Recording grant, macOS may require LocalScribe to be quit
 and reopened before capture is enabled; the app reports that state explicitly
@@ -222,6 +227,7 @@ The architecture is fixed before implementation:
 - [ADR-0001: macOS technical vertical](Docs/Architecture/ADR-0001-macos-technical-vertical.md)
 - [ADR-0002: unbounded local whisper.cpp model selection](Docs/Architecture/ADR-0002-unbounded-local-whisper-model-selection.md)
 - [ADR-0003: one-line transcript segments](Docs/Architecture/ADR-0003-one-line-transcript-segments.md)
+- [ADR-0004: best-effort local call detection](Docs/Architecture/ADR-0004-call-detection.md)
 - [Swift/C++ API boundary](Docs/Architecture/Swift-Cxx-API.md)
 - [Project structure](Docs/Architecture/Project-Structure.md)
 - [Session state machine](Docs/Architecture/Session-State-Machine.md)
@@ -229,7 +235,10 @@ The architecture is fixed before implementation:
 
 ## Deliberate Stage 0 limits
 
-- Start is manual; detection remains a proposal-only seam.
+- Detection is proposal-only and best effort. Native Zoom, Yandex Telemost,
+  and compatible Skype clients use local process/audio metadata; Google Meet
+  and other browser calls additionally depend on privacy-gated window titles.
+  Manual start remains available.
 - Remote-speaker labels come from lightweight, model-free acoustic clustering.
   Each call can still create up to eight new anonymous clusters. Explicitly
   saved compatible profiles may supply names across calls, while unmatched or

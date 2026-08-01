@@ -4,7 +4,7 @@ import SwiftUI
 struct LocalScribeApp: App {
     @NSApplicationDelegateAdaptor(ApplicationDelegate.self)
     private var applicationDelegate
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
 
     var body: some Scene {
         MenuBarExtra {
@@ -21,6 +21,8 @@ struct LocalScribeApp: App {
     }
 
     init() {
+        let model = AppModel()
+        _model = StateObject(wrappedValue: model)
         applicationDelegate.model = model
     }
 }

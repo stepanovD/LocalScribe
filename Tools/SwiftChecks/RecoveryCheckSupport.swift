@@ -320,10 +320,35 @@ func runMultiSessionRecoveryQueueCheck() async throws {
         )
     }
 
+    let detectedProposalID = UUID(
+        uuidString: "30303030-1111-2222-3333-444444444444"
+    )!
+    guard await controller.proposeDetectedCall(id: detectedProposalID),
+          await controller.currentSnapshot().state == .awaitingConsent,
+          await permissions.requestCount() == 0,
+          await microphone.startCount() == 0,
+          await systemAudio.startCount() == 0
+    else {
+        throw RecoveryCheckError.invariant(
+            "a detected call did not expose consent without capture"
+        )
+    }
+
+    await controller.dismissProposal(
+        expectedDetectedProposalID: UUID()
+    )
+    guard await controller.currentSnapshot().state == .awaitingConsent else {
+        throw RecoveryCheckError.invariant(
+            "a stale call episode dismissed a newer consent proposal"
+        )
+    }
+    await controller.dismissProposal(
+        expectedDetectedProposalID: detectedProposalID
+    )
     try await controller.proposeManualStart()
     guard await controller.currentSnapshot().state == .awaitingConsent else {
         throw RecoveryCheckError.invariant(
-            "capture did not unlock after all recovery rows were acknowledged"
+            "capture proposals did not unlock after recovery was acknowledged"
         )
     }
 }

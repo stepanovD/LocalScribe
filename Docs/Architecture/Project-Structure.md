@@ -42,6 +42,8 @@ LocalScribe/
 │   ├── App/
 │   │   ├── LocalScribeApp.swift
 │   │   ├── ApplicationDelegate.swift
+│   │   ├── DetectedCallPromptWindowController.swift
+│   │   ├── DetectedCallProposal.swift
 │   │   ├── TerminationRequestCoordinator.swift
 │   │   ├── AppModel.swift
 │   │   └── Views/
@@ -59,8 +61,11 @@ LocalScribe/
 │   │   ├── StagingDirectory.swift
 │   │   └── VaultWriter.swift
 │   └── System/
+│       ├── CallDetectionModel.swift
+│       ├── SystemCallDetectionMonitor.swift
 │       └── PermissionClient.swift
 ├── Tests/Swift/
+│   ├── CallDetectionTests.swift
 │   ├── CaptureContractTests.swift
 │   ├── RecoveryStartupTests.swift
 │   └── StorageSafetyTests.swift
@@ -203,6 +208,17 @@ backend-neutral and has no Apple dependency.
   using sticky per-source mailbox health and identity-tagged workers;
 - never starts a source from a detection-only event.
 
+### `macOS/System` call detection
+
+- samples process audio-input state and Window Server metadata without opening
+  an audio tap or requesting a permission;
+- reduces raw window titles to Zoom/Telemost/Google Meet signatures before
+  emitting an event and never persists or logs them;
+- debounces call beginnings and endings into identity-scoped episodes;
+- treats an unavailable system snapshot as unknown, never as evidence that a
+  call ended;
+- can only request the session actor to expose visible consent UI.
+
 ### `Tools`
 
 - provides deterministic fixtures and fault injection;
@@ -252,5 +268,6 @@ test executable must compile, link, and pass without any macOS framework.
 | Security-scoped bookmarks | Swift tests and signed-app manual test |
 | External-edit conflict | Swift storage tests |
 | Capture timestamps/formats | adapter contract tests |
+| Zoom/Telemost/Google Meet/Skype matching and episode debounce | Swift tests/checks + signed-app manual matrix |
 | TCC/device changes | signed-app manual matrix |
 | Two-hour durability | `LocalScribeSoak` + signed-app run |

@@ -73,7 +73,8 @@ struct SwiftChecks {
         try await runDelayedRecoveryEventsDoNotGhostCheck()
         try await runCaptureBarrierCheck()
         try checkTerminationRequestCoalescing()
-        print("swift checks: 30 passed")
+        try await runCallDetectionCheck()
+        print("swift checks: 31 passed")
     }
 
     private static func require(

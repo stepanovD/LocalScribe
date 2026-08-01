@@ -29,7 +29,7 @@ stateDiagram-v2
 
     recording --> paused: explicit Pause
     paused --> recording: explicit Resume
-    recording --> finalizing: explicit Stop / confirmed call end
+    recording --> finalizing: explicit Stop
     paused --> finalizing: explicit Stop
 
     recording --> recovery_required: process crash
@@ -77,6 +77,21 @@ created by the visible Start action.
   compiled/configured as a test product.
 
 Violation is a fatal state-transition error before any capture adapter call.
+
+## Detected-call proposals
+
+Best-effort Zoom/Telemost/Google Meet/Skype detection owns an ephemeral episode
+UUID. The session actor accepts that UUID only from `idle` or the same safe
+terminal shell states as manual start, emits `detected`, and moves to
+`awaiting_consent` for the visible panel. A detected Start, dismissal, or
+call-end event must present the same UUID; stale episode events are ignored.
+Manual consent has no detected episode UUID and cannot be dismissed by a
+detector event.
+
+The detector is started only after startup recovery has completed successfully.
+If a call ends while its proposal is still pending, the proposal returns to
+`idle`. Once visible Start has been accepted, later detector events have no
+authority over `preparing`, `recording`, or finalization and never stop capture.
 
 ## Transition transaction rules
 

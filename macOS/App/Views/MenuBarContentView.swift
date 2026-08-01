@@ -69,7 +69,7 @@ struct MenuBarContentView: View {
     @ViewBuilder
     private var content: some View {
         switch model.session.state {
-        case .idle, .detected, .failedToStart, .complete,
+        case .idle, .failedToStart, .complete,
              .incompleteSources, .interrupted:
             if let failure = model.session.failureCode ?? model.setupFailure {
                 Label(failureText(failure), systemImage: "exclamationmark.triangle")
@@ -85,9 +85,9 @@ struct MenuBarContentView: View {
             .disabled(!model.hasVaultSelection || !model.hasModelSelection)
             .accessibilityHint("Opens a separate consent step before capture")
 
-        case .awaitingConsent:
+        case .detected, .awaitingConsent:
             VStack(alignment: .leading, spacing: 10) {
-                Text("Create a local transcript?")
+                Text(consentTitle)
                     .font(.headline)
                 Text(
                     "After you press Start Recording, LocalScribe will request access and capture both your microphone and system audio."
@@ -104,10 +104,19 @@ struct MenuBarContentView: View {
                         model.confirmVisibleStart()
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!model.canStartRecording)
                     .keyboardShortcut(.defaultAction)
                     .accessibilityHint(
                         "Explicitly consents to microphone and system audio capture"
                     )
+                }
+                if !model.canStartRecording {
+                    Text(
+                        "Choose a transcript folder and local ASR model in Settings before recording."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -378,6 +387,13 @@ struct MenuBarContentView: View {
         case .interrupted:
             "Interrupted transcript preserved"
         }
+    }
+
+    private var consentTitle: String {
+        if let proposal = model.detectedCallProposal {
+            return "\(proposal.applicationName) call detected. Start recording?"
+        }
+        return "Create a local transcript?"
     }
 
     private func failureText(_ failure: SessionFailureCode) -> String {
