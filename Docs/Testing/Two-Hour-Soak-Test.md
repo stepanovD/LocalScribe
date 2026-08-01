@@ -212,6 +212,33 @@ Performance gates:
 Model quality WER/DER gates use a separate benchmark corpus. A soak test proves
 durability and latency, not recognition accuracy.
 
+## Voice-profile cross-call companion
+
+Persistent speaker naming needs a multi-session companion; it is not proven by
+one long recording. The automated form uses deterministic embeddings, and the
+signed-app form uses consented, retention-controlled speech from at least two
+people:
+
+1. record call A, leave two remote clusters anonymous, and explicitly save one
+   cluster with a name;
+2. verify the durable call-A segments and republished Markdown use that name,
+   while the other cluster remains `Speaker N`;
+3. close the session and core, relaunch the application, then record call B with
+   different words from the enrolled and an unknown speaker;
+4. verify only compatible, unambiguous evidence receives the saved name; short,
+   close-score, corrupt, wrong-dimension, and wrong-model fixtures remain
+   anonymous;
+5. rename the profile and verify a later call uses the new name without silently
+   rewriting unrelated historical files;
+6. delete the profile, relaunch, and verify the same fixture is anonymous;
+7. run SQLite integrity/foreign-key checks and verify raw audio and descriptor
+   bytes never appear in Markdown, diagnostics, or crash metadata.
+
+The real-audio evidence separates enrollment and evaluation calls and varies
+phrase, gain, playback device, background noise, RU/EN speech, and overlap. It
+reports false accepts, false rejects, anonymous coverage, and named-speaker DER;
+a deterministic pass is not a biometric-accuracy claim.
+
 ## Crash-recovery companion
 
 A separate automated companion run is mandatory because killing the product

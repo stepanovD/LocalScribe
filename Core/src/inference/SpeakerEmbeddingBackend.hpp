@@ -20,8 +20,10 @@ struct SpeakerMatch {
 };
 
 /*
- * Stage 0 does not persist voice profiles, but this backend-neutral seam keeps
- * future profile implementations out of session, Swift, and SQLite types.
+ * Backend-neutral seam for learned speaker encoders. The built-in offline
+ * fallback currently persists versioned descriptors through the journal;
+ * future encoders can implement the same embed/match boundary without
+ * exposing third-party types to the session runtime.
  */
 class ISpeakerEmbeddingBackend {
 public:

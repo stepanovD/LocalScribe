@@ -86,7 +86,8 @@ if(LOCALSCRIBE_BUILD_TESTS)
         Core/tests/ContractTests.cpp
         Core/tests/JournalRecoveryTests.cpp
         Core/tests/MarkdownGoldenTests.cpp
-        Core/tests/StateMachineTests.cpp)
+        Core/tests/StateMachineTests.cpp
+        Core/tests/VoiceProfileTests.cpp)
     target_compile_features(LocalScribeCoreTests PRIVATE cxx_std_20)
     target_include_directories(
         LocalScribeCoreTests

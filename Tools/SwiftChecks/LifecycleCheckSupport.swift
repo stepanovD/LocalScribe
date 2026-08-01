@@ -1417,6 +1417,309 @@ func runConcurrentStopTerminationCheck() async throws {
     }
 }
 
+func runVoiceProfileCheck() async throws {
+    let anonymousOne = UInt64(1) << 63 | 1
+    let anonymousTwo = UInt64(1) << 63 | 2
+    let anonymousThree = UInt64(1) << 63 | 3
+    let anonymousFinalized = UInt64(1) << 63 | 4
+    let writer = SequencedMarkdownPublisher()
+    let session = LifecycleCheckSession(
+        finalSegmentOnFinalize: CoreTranscriptSegment(
+            stableID: UUID(),
+            sourceID: 2,
+            startTimeNanoseconds: 7_000_000_000,
+            endTimeNanoseconds: 8_000_000_000,
+            speakerID: anonymousFinalized,
+            speakerLabel: "Speaker finalized",
+            text: "Final segment produced while draining",
+            language: "en",
+            confidence: 0.9,
+            revision: 1,
+            isFinal: true,
+            isUnintelligible: false
+        )
+    )
+    let core = LifecycleCheckCore(session: session)
+    let vaultSelection = LifecycleCheckVaultSelection()
+    let controller = SessionController(
+        coreClient: core,
+        permissions: LifecycleCheckPermissions(),
+        directoryStore: vaultSelection,
+        modelStore: LifecycleCheckModelSelection(),
+        vaultWriter: writer,
+        microphoneCapture: LifecycleCheckCapture(
+            sourceID: 1,
+            kind: .microphone
+        ),
+        systemAudioCapture: LifecycleCheckCapture(
+            sourceID: 2,
+            kind: .systemAudio
+        ),
+        journalURL: URL(fileURLWithPath: "/private/tmp/voice-profile-check.sqlite3")
+    )
+
+    await controller.recoverInterruptedSessions()
+    try await controller.proposeManualStart()
+    let token = await MainActor.run {
+        VisibleConsentIssuer().issue(for: .start)
+    }
+    await controller.start(
+        after: token,
+        request: SessionStartRequest(
+            sourceApplication: "Voice profile check",
+            title: "Original voice profile title",
+            preferredFilenameStem: "Original voice profile filename",
+            localSpeakerName: "Me",
+            languageMode: .russianEnglish
+        )
+    )
+
+    let speakerSequence: [(UInt64, String)] = [
+        (anonymousOne, "Speaker 1"),
+        (anonymousOne, "Speaker 1"),
+        (anonymousTwo, "Speaker 2"),
+        (anonymousTwo, "Speaker 2"),
+        (anonymousThree, "Speaker 3"),
+        (anonymousThree, "Speaker 3"),
+    ]
+    for (index, speaker) in speakerSequence.enumerated() {
+        session.enqueueFinalSegment(
+            CoreTranscriptSegment(
+                stableID: UUID(),
+                sourceID: 2,
+                startTimeNanoseconds: Int64(index) * 1_000_000_000,
+                endTimeNanoseconds: Int64(index + 1) * 1_000_000_000,
+                speakerID: speaker.0,
+                speakerLabel: speaker.1,
+                text: "Voice profile segment \(index)",
+                language: "en",
+                confidence: 0.9,
+                revision: 1,
+                isFinal: true,
+                isUnintelligible: false
+            )
+        )
+    }
+
+    guard await eventually(timeout: .seconds(2), {
+        let snapshot = await controller.currentSnapshot()
+        return snapshot.speakers.count == 3
+            && snapshot.speakers.first(where: {
+                $0.speakerID == anonymousOne
+            })?.segmentCount == 2
+    }) else {
+        throw LifecycleCheckError.invariant(
+            "speaker review was derived only from the recent-segment window"
+        )
+    }
+
+    let activeSnapshot = await controller.currentSnapshot()
+    guard let sessionID = activeSnapshot.sessionID else {
+        throw LifecycleCheckError.invariant(
+            "speaker review did not retain its session identity"
+        )
+    }
+    var rejectedMismatchedSession = false
+    do {
+        _ = try await controller.enrollVoiceProfile(
+            sessionID: UUID(),
+            speakerID: anonymousOne,
+            displayName: "Wrong call"
+        )
+    } catch {
+        rejectedMismatchedSession = true
+    }
+    guard rejectedMismatchedSession else {
+        throw LifecycleCheckError.invariant(
+            "voice enrollment accepted a speaker from another session"
+        )
+    }
+
+    let livePublishCount = await writer.publishCount
+    let firstEnrollment = try await controller.enrollVoiceProfile(
+        sessionID: sessionID,
+        speakerID: anonymousOne,
+        displayName: "Alice"
+    )
+    let firstSnapshot = await controller.currentSnapshot()
+    let profilesAfterFirstEnrollment = try await controller.voiceProfiles()
+    guard firstEnrollment.speakerID & (UInt64(1) << 62) != 0,
+          firstEnrollment.speakerID & (UInt64(1) << 63) == 0,
+          firstSnapshot.speakers.contains(where: {
+              $0.sessionID == sessionID
+                  && $0.speakerID == firstEnrollment.speakerID
+                  && $0.displayName == "Alice"
+                  && !$0.isAnonymous
+          }),
+          profilesAfterFirstEnrollment.map(\.displayName) == ["Alice"]
+    else {
+        throw LifecycleCheckError.invariant(
+            "live enrollment did not replace the anonymous speaker locally"
+        )
+    }
+    guard await eventually(timeout: .seconds(2), {
+        await writer.publishCount > livePublishCount
+    }) else {
+        throw LifecycleCheckError.invariant(
+            "live enrollment did not schedule a replacement publication"
+        )
+    }
+
+    await controller.stop()
+    let stoppedSnapshot = await controller.currentSnapshot()
+    guard session.terminalDrainPollCount > 0,
+          stoppedSnapshot.speakers.count == 4,
+          stoppedSnapshot.speakers.contains(where: {
+              $0.speakerID == anonymousFinalized
+                  && $0.latestExcerpt
+                    == "Final segment produced while draining"
+          })
+    else {
+        throw LifecycleCheckError.invariant(
+            "Stop discarded a final segment produced while finalizing"
+        )
+    }
+
+    let terminalPublishCount = await writer.publishCount
+    await writer.blockNextPublication()
+    let enrollmentCompletion = LifecycleCheckCompletion()
+    let secondEnrollmentTask = Task {
+        let enrollment = try await controller.enrollVoiceProfile(
+            sessionID: sessionID,
+            speakerID: anonymousTwo,
+            displayName: "Bob"
+        )
+        await enrollmentCompletion.markVoiceEnrollmentReturned()
+        return enrollment
+    }
+    guard await eventually(timeout: .seconds(1), {
+        let enrollmentReturned =
+            await enrollmentCompletion.voiceEnrollmentReturned
+        let publicationBlocked = await writer.blockedPublicationEntered
+        return enrollmentReturned && publicationBlocked
+    }) else {
+        await writer.releaseBlockedPublication()
+        secondEnrollmentTask.cancel()
+        _ = try? await secondEnrollmentTask.value
+        throw LifecycleCheckError.invariant(
+            "terminal enrollment waited for a blocked transcript publication"
+        )
+    }
+    let secondEnrollment = try await secondEnrollmentTask.value
+    let thirdEnrollment = try await controller.enrollVoiceProfile(
+        sessionID: sessionID,
+        speakerID: anonymousThree,
+        displayName: "Carol"
+    )
+
+    await vaultSelection.setSelected(false)
+    try await controller.proposeManualStart()
+    let failedStartToken = await MainActor.run {
+        VisibleConsentIssuer().issue(for: .start)
+    }
+    let failedStartCompletion = LifecycleCheckCompletion()
+    let failedStartTask = Task {
+        await controller.start(
+            after: failedStartToken,
+            request: SessionStartRequest(
+                sourceApplication: "Failed next call",
+                title: "Failed next call",
+                preferredFilenameStem: "Failed next call",
+                localSpeakerName: "Me",
+                languageMode: .russianEnglish
+            )
+        )
+        await failedStartCompletion.markStartReturned()
+    }
+    guard await eventually(timeout: .seconds(1), {
+        await failedStartCompletion.startReturned
+    }) else {
+        await writer.releaseBlockedPublication()
+        await failedStartTask.value
+        throw LifecycleCheckError.invariant(
+            "a blocked review publication held the lifecycle slot"
+        )
+    }
+    await failedStartTask.value
+    let failedStartSnapshot = await controller.currentSnapshot()
+    guard failedStartSnapshot.state == .failedToStart,
+          failedStartSnapshot.failureCode == .vaultNotSelected,
+          failedStartSnapshot.sessionID == sessionID,
+          failedStartSnapshot.speakers.contains(where: {
+              $0.speakerID == thirdEnrollment.speakerID
+                  && $0.displayName == "Carol"
+          })
+    else {
+        await writer.releaseBlockedPublication()
+        throw LifecycleCheckError.invariant(
+            "a failed next start discarded the previous speaker review"
+        )
+    }
+
+    await writer.releaseBlockedPublication()
+    guard await eventually(timeout: .seconds(2), {
+        await writer.publishCount >= terminalPublishCount + 2
+    }) else {
+        throw LifecycleCheckError.invariant(
+            "coalesced terminal enrollments were not republished"
+        )
+    }
+    let terminalSnapshot = await controller.currentSnapshot()
+    guard core.recoverableOpenCount > 0,
+          await writer.lastPreferredFilenameStem
+              == "Original voice profile filename",
+          session.lastRenderedTitle == "Original voice profile title",
+          terminalSnapshot.failureCode == .vaultNotSelected,
+          terminalSnapshot.speakers.contains(where: {
+              $0.speakerID == secondEnrollment.speakerID
+                  && $0.displayName == "Bob"
+                  && !$0.isAnonymous
+          })
+    else {
+        throw LifecycleCheckError.invariant(
+            "terminal enrollment did not safely republish the original transcript"
+        )
+    }
+
+    try await controller.renameVoiceProfile(
+        profileID: firstEnrollment.profileID,
+        displayName: "Alicia"
+    )
+    let profilesAfterRename = try await controller.voiceProfiles()
+    guard profilesAfterRename.contains(where: {
+        $0.profileID == firstEnrollment.profileID
+            && $0.displayName == "Alicia"
+    }) else {
+        throw LifecycleCheckError.invariant(
+            "voice profile rename was not visible through the controller"
+        )
+    }
+    try await controller.deleteVoiceProfile(
+        profileID: secondEnrollment.profileID
+    )
+    let profilesAfterDelete = try await controller.voiceProfiles()
+    guard !profilesAfterDelete.contains(where: {
+        $0.profileID == secondEnrollment.profileID
+    }) else {
+        throw LifecycleCheckError.invariant(
+            "voice profile deletion was not visible through the controller"
+        )
+    }
+}
+
+func runLatestRequestGenerationCheck() throws {
+    var generation = LatestRequestGeneration()
+    let stale = generation.advance()
+    let latest = generation.advance()
+    guard !generation.isCurrent(stale),
+          generation.isCurrent(latest)
+    else {
+        throw LifecycleCheckError.invariant(
+            "an older async profile refresh could overwrite a newer result"
+        )
+    }
+}
+
 private func eventually(
     timeout: Duration,
     _ predicate: @escaping @Sendable () async -> Bool
@@ -1437,6 +1740,7 @@ private actor LifecycleCheckCompletion {
     private(set) var stopReturned = false
     private(set) var terminationReturned = false
     private(set) var preparingStartReturned = false
+    private(set) var voiceEnrollmentReturned = false
 
     func markStartReturned() {
         startReturned = true
@@ -1453,6 +1757,10 @@ private actor LifecycleCheckCompletion {
     func markPreparingStartReturned() {
         preparingStartReturned = true
     }
+
+    func markVoiceEnrollmentReturned() {
+        voiceEnrollmentReturned = true
+    }
 }
 
 private actor SequencedMarkdownPublisher: MarkdownPublishing {
@@ -1460,11 +1768,35 @@ private actor SequencedMarkdownPublisher: MarkdownPublishing {
         UUID: MarkdownPublicationReceipt
     ] = [:]
     private(set) var publishCount = 0
+    private(set) var lastPreferredFilenameStem: String?
+    private var shouldBlockNextPublication = false
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private(set) var blockedPublicationEntered = false
+
+    func blockNextPublication() {
+        shouldBlockNextPublication = true
+        blockedPublicationEntered = false
+    }
+
+    func releaseBlockedPublication() {
+        shouldBlockNextPublication = false
+        let continuation = blockedContinuation
+        blockedContinuation = nil
+        continuation?.resume()
+    }
 
     func publish(
         _ request: MarkdownPublicationRequest
     ) async throws -> MarkdownPublicationReceipt {
+        if shouldBlockNextPublication {
+            shouldBlockNextPublication = false
+            blockedPublicationEntered = true
+            await withCheckedContinuation { continuation in
+                blockedContinuation = continuation
+            }
+        }
         publishCount += 1
+        lastPreferredFilenameStem = request.preferredFilenameStem
         let sequence = publishCount
         let filename = "Late publication \(sequence).md"
         let receipt = MarkdownPublicationReceipt(
@@ -1584,7 +1916,17 @@ private actor LifecycleCheckPermissions: PermissionProviding {
 }
 
 private actor LifecycleCheckVaultSelection: VaultSelectionProviding {
-    func hasSelection() -> Bool { true }
+    private var selected: Bool
+
+    init(selected: Bool = true) {
+        self.selected = selected
+    }
+
+    func hasSelection() -> Bool { selected }
+
+    func setSelected(_ selected: Bool) {
+        self.selected = selected
+    }
 }
 
 private actor LifecycleCheckModelSelection: ModelSelectionProviding {
@@ -2221,6 +2563,11 @@ private final class LifecycleCheckCore:
     @unchecked Sendable
 {
     private let session: LifecycleCheckSession
+    private let lock = NSLock()
+    private var createdSessionID: UUID?
+    private var profiles: [UInt64: CoreVoiceProfile] = [:]
+    private var nextProfileID: UInt64 = 1
+    private var recoverableOpens = 0
 
     init(session: LifecycleCheckSession) {
         self.session = session
@@ -2229,7 +2576,10 @@ private final class LifecycleCheckCore:
     func createSessionAfterConsent(
         configuration: CoreSessionConfiguration
     ) -> any CoreSessionProtocol {
-        session
+        lock.withLock {
+            createdSessionID = configuration.sessionID
+        }
+        return session
     }
 
     func recoverableSessionIDs() -> [String] { [] }
@@ -2237,7 +2587,79 @@ private final class LifecycleCheckCore:
     func openRecoverableSession(id: String) throws
         -> any CoreSessionProtocol
     {
-        throw CoreBridgeError.unavailable
+        let matches = lock.withLock { () -> Bool in
+            guard createdSessionID?.uuidString.lowercased() == id else {
+                return false
+            }
+            recoverableOpens += 1
+            return true
+        }
+        guard matches else {
+            throw CoreBridgeError.unavailable
+        }
+        return session
+    }
+
+    var recoverableOpenCount: Int {
+        lock.withLock { recoverableOpens }
+    }
+
+    func listVoiceProfiles() -> [CoreVoiceProfile] {
+        lock.withLock {
+            profiles.values.sorted { $0.profileID < $1.profileID }
+        }
+    }
+
+    func enrollVoiceProfile(
+        sessionID: UUID,
+        speakerID: UInt64,
+        displayName: String
+    ) throws -> CoreVoiceProfileEnrollment {
+        try lock.withLock {
+            guard sessionID == createdSessionID else {
+                throw CoreBridgeError.unavailable
+            }
+            let profileID = nextProfileID
+            nextProfileID += 1
+            let samples: UInt64 = 2
+            profiles[profileID] = CoreVoiceProfile(
+                profileID: profileID,
+                displayName: displayName,
+                sampleCount: samples
+            )
+            return CoreVoiceProfileEnrollment(
+                profileID: profileID,
+                speakerID: UInt64(1) << 62 | profileID,
+                sampleCount: samples,
+                relabeledSegments: 2,
+                journalCheckpoint: 3,
+                highestSegmentRevision: 1
+            )
+        }
+    }
+
+    func renameVoiceProfile(
+        profileID: UInt64,
+        displayName: String
+    ) throws {
+        try lock.withLock {
+            guard let profile = profiles[profileID] else {
+                throw CoreBridgeError.unavailable
+            }
+            profiles[profileID] = CoreVoiceProfile(
+                profileID: profile.profileID,
+                displayName: displayName,
+                sampleCount: profile.sampleCount
+            )
+        }
+    }
+
+    func deleteVoiceProfile(profileID: UInt64) throws {
+        try lock.withLock {
+            guard profiles.removeValue(forKey: profileID) != nil else {
+                throw CoreBridgeError.unavailable
+            }
+        }
     }
 }
 
@@ -2306,6 +2728,7 @@ private final class LifecycleCheckSession:
     private let blocksRenderAfterCount: Int?
     private let blocksMetricsAfterCount: Int?
     private let blocksAcknowledgementAfterCount: Int?
+    private let finalSegmentOnFinalize: CoreTranscriptSegment?
     private var finalizeReleased = false
     private var finalizeWasEntered = false
     private var renderCalls = 0
@@ -2319,18 +2742,22 @@ private final class LifecycleCheckSession:
     private var completedAcknowledgementCalls = 0
     private var acknowledgementReleased = false
     private var blockedAcknowledgementWasEntered = false
+    private var renderedTitle: String?
+    private var terminalDrainPolls = 0
 
     init(
         blocksFinalize: Bool = false,
         blocksRenderAfterCount: Int? = nil,
         blocksMetricsAfterCount: Int? = nil,
-        blocksAcknowledgementAfterCount: Int? = nil
+        blocksAcknowledgementAfterCount: Int? = nil,
+        finalSegmentOnFinalize: CoreTranscriptSegment? = nil
     ) {
         self.blocksFinalize = blocksFinalize
         self.blocksRenderAfterCount = blocksRenderAfterCount
         self.blocksMetricsAfterCount = blocksMetricsAfterCount
         self.blocksAcknowledgementAfterCount =
             blocksAcknowledgementAfterCount
+        self.finalSegmentOnFinalize = finalSegmentOnFinalize
     }
 
     var hasEnteredFinalize: Bool {
@@ -2343,6 +2770,25 @@ private final class LifecycleCheckSession:
         condition.lock()
         defer { condition.unlock() }
         return isClosed
+    }
+
+    var lastRenderedTitle: String? {
+        condition.lock()
+        defer { condition.unlock() }
+        return renderedTitle
+    }
+
+    var terminalDrainPollCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return terminalDrainPolls
+    }
+
+    func enqueueFinalSegment(_ segment: CoreTranscriptSegment) {
+        condition.lock()
+        events.append(.finalSegment(segment))
+        condition.signal()
+        condition.unlock()
     }
 
     func releaseFinalize() {
@@ -2451,6 +2897,9 @@ private final class LifecycleCheckSession:
         phase = reason == .cancelled ? .failedToStart : .complete
         let status: CorePublishedStatus =
             phase == .complete ? .complete : .interrupted
+        if let finalSegmentOnFinalize {
+            events.append(.finalSegment(finalSegmentOnFinalize))
+        }
         events.append(
             phase == .failedToStart
                 ? .stateChanged(
@@ -2475,6 +2924,12 @@ private final class LifecycleCheckSession:
     func nextEvent(timeoutMilliseconds: UInt32) throws -> CoreEvent? {
         condition.lock()
         defer { condition.unlock() }
+        if timeoutMilliseconds == 0,
+           phase == .complete || phase == .incompleteSources
+                || phase == .interrupted
+        {
+            terminalDrainPolls += 1
+        }
         if events.isEmpty && !isClosed {
             let deadline = Date().addingTimeInterval(
                 Double(timeoutMilliseconds) / 1_000
@@ -2544,6 +2999,7 @@ private final class LifecycleCheckSession:
     ) -> CoreRenderedMarkdown {
         condition.lock()
         renderCalls += 1
+        renderedTitle = options.title
         if let blocksRenderAfterCount,
            renderCalls > blocksRenderAfterCount
         {

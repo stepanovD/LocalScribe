@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <string>
 #include <utility>
@@ -36,6 +39,211 @@ public:
 private:
     sqlite3_stmt *statement_{};
 };
+
+constexpr std::size_t kMaximumEmbeddingDimensions = 4'096;
+constexpr std::size_t kMaximumProfilePrototypes = 6;
+constexpr std::size_t kMaximumVoiceProfiles = 1'024;
+
+std::vector<std::uint8_t> encodeEmbedding(std::span<const float> values)
+{
+    std::vector<std::uint8_t> result;
+    result.reserve(values.size() * sizeof(float));
+    for (const float value : values) {
+        const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+        result.push_back(static_cast<std::uint8_t>(bits));
+        result.push_back(static_cast<std::uint8_t>(bits >> 8u));
+        result.push_back(static_cast<std::uint8_t>(bits >> 16u));
+        result.push_back(static_cast<std::uint8_t>(bits >> 24u));
+    }
+    return result;
+}
+
+Expected<std::vector<float>> decodeEmbedding(
+    sqlite3_stmt *statement,
+    int column,
+    bool allowEmpty)
+{
+    const int byteCount = sqlite3_column_bytes(statement, column);
+    const auto *bytes = static_cast<const std::uint8_t *>(
+        sqlite3_column_blob(statement, column));
+    if (byteCount == 0 && allowEmpty) {
+        return std::vector<float>{};
+    }
+    if (bytes == nullptr || byteCount <= 0
+        || byteCount % static_cast<int>(sizeof(float)) != 0
+        || static_cast<std::size_t>(byteCount / sizeof(float))
+            > kMaximumEmbeddingDimensions) {
+        return Error{
+            LS_RECOVERY_ERROR,
+            "journal has an invalid speaker embedding"};
+    }
+    std::vector<float> result;
+    result.reserve(static_cast<std::size_t>(byteCount) / sizeof(float));
+    for (int offset = 0; offset < byteCount; offset += 4) {
+        const std::uint32_t bits =
+            static_cast<std::uint32_t>(bytes[offset])
+            | (static_cast<std::uint32_t>(bytes[offset + 1]) << 8u)
+            | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16u)
+            | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24u);
+        const float value = std::bit_cast<float>(bits);
+        if (!std::isfinite(value)) {
+            return Error{
+                LS_RECOVERY_ERROR,
+                "journal speaker embedding contains a non-finite value"};
+        }
+        result.push_back(value);
+    }
+    return result;
+}
+
+void bindEmbedding(
+    sqlite3_stmt *statement,
+    int index,
+    std::span<const float> values)
+{
+    const auto bytes = encodeEmbedding(values);
+    if (bytes.empty()) {
+        sqlite3_bind_zeroblob(statement, index, 0);
+        return;
+    }
+    sqlite3_bind_blob(
+        statement,
+        index,
+        bytes.data(),
+        static_cast<int>(bytes.size()),
+        SQLITE_TRANSIENT);
+}
+
+bool validEmbedding(
+    const std::string &modelId,
+    std::span<const float> values,
+    bool allowEmpty)
+{
+    if (values.empty()) {
+        return allowEmpty && modelId.empty();
+    }
+    return !modelId.empty() && modelId.size() <= 256
+        && values.size() <= kMaximumEmbeddingDimensions
+        && std::all_of(values.begin(), values.end(), [](float value) {
+               return std::isfinite(value);
+           });
+}
+
+bool isUnicodeWhitespace(std::uint32_t codePoint)
+{
+    return codePoint == 0x00A0u || codePoint == 0x1680u
+        || (codePoint >= 0x2000u && codePoint <= 0x200Au)
+        || codePoint == 0x2028u || codePoint == 0x2029u
+        || codePoint == 0x202Fu || codePoint == 0x205Fu
+        || codePoint == 0x3000u;
+}
+
+bool validProfileName(const std::string &value)
+{
+    if (value.empty() || value.size() > 256) {
+        return false;
+    }
+    std::size_t index = 0;
+    bool hasVisibleCharacter = false;
+    while (index < value.size()) {
+        const auto first = static_cast<unsigned char>(value[index]);
+        if (first < 0x80u) {
+            if (first == 0 || first < 0x20u || first == 0x7Fu) {
+                return false;
+            }
+            if (std::isspace(first) == 0) {
+                hasVisibleCharacter = true;
+            }
+            ++index;
+            continue;
+        }
+        std::size_t length = 0;
+        std::uint32_t codePoint = 0;
+        std::uint32_t minimum = 0;
+        if (first >= 0xC2u && first <= 0xDFu) {
+            length = 2;
+            codePoint = first & 0x1Fu;
+            minimum = 0x80u;
+        } else if (first >= 0xE0u && first <= 0xEFu) {
+            length = 3;
+            codePoint = first & 0x0Fu;
+            minimum = 0x800u;
+        } else if (first >= 0xF0u && first <= 0xF4u) {
+            length = 4;
+            codePoint = first & 0x07u;
+            minimum = 0x10000u;
+        } else {
+            return false;
+        }
+        if (index + length > value.size()) {
+            return false;
+        }
+        for (std::size_t offset = 1; offset < length; ++offset) {
+            const auto byte =
+                static_cast<unsigned char>(value[index + offset]);
+            if ((byte & 0xC0u) != 0x80u) {
+                return false;
+            }
+            codePoint = (codePoint << 6u) | (byte & 0x3Fu);
+        }
+        if (codePoint < minimum || codePoint > 0x10FFFFu
+            || (codePoint >= 0xD800u && codePoint <= 0xDFFFu)
+            || (codePoint >= 0x80u && codePoint <= 0x9Fu)
+            || codePoint == 0x2028u || codePoint == 0x2029u) {
+            return false;
+        }
+        if (!isUnicodeWhitespace(codePoint)) {
+            hasVisibleCharacter = true;
+        }
+        index += length;
+    }
+    return hasVisibleCharacter;
+}
+
+bool equalNameCaseInsensitive(
+    const std::string &left,
+    const std::string &right)
+{
+    return sqlite3_stricmp(left.c_str(), right.c_str()) == 0;
+}
+
+bool normalizeEmbedding(std::vector<float> &values)
+{
+    long double magnitude = 0.0L;
+    for (const float value : values) {
+        magnitude += static_cast<long double>(value) * value;
+    }
+    if (!std::isfinite(magnitude) || magnitude <= 1.0e-12L) {
+        return false;
+    }
+    const float scale =
+        1.0F / static_cast<float>(std::sqrt(magnitude));
+    for (float &value : values) {
+        value *= scale;
+    }
+    return true;
+}
+
+float cosineSimilarity(
+    std::span<const float> left,
+    std::span<const float> right)
+{
+    if (left.empty() || left.size() != right.size()) {
+        return -1.0F;
+    }
+    return std::inner_product(
+        left.begin(),
+        left.end(),
+        right.begin(),
+        0.0F);
+}
+
+std::int64_t unixTimeNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 Error sqliteError(sqlite3 *database, std::string context)
 {
@@ -154,6 +362,19 @@ bool sameSegment(sqlite3_stmt *row, const TranscriptSegment &segment)
             stable)) {
         return false;
     }
+    const auto encodedEmbedding = encodeEmbedding(segment.speakerEmbedding);
+    const auto *storedEmbedding = static_cast<const std::uint8_t *>(
+        sqlite3_column_blob(row, 12));
+    const int storedEmbeddingSize = sqlite3_column_bytes(row, 12);
+    const bool sameEmbedding = encodedEmbedding.empty()
+        ? storedEmbeddingSize == 0
+        : storedEmbedding != nullptr
+            && storedEmbeddingSize
+                == static_cast<int>(encodedEmbedding.size())
+            && std::equal(
+                encodedEmbedding.begin(),
+                encodedEmbedding.end(),
+                storedEmbedding);
     return static_cast<std::uint64_t>(sqlite3_column_int64(row, 1))
             == segment.sourceId
         && sqlite3_column_int64(row, 2) == segment.startTimeNs
@@ -166,7 +387,11 @@ bool sameSegment(sqlite3_stmt *row, const TranscriptSegment &segment)
         && static_cast<float>(sqlite3_column_double(row, 8))
             == segment.confidence
         && static_cast<std::uint32_t>(sqlite3_column_int64(row, 9))
-            == segment.flags;
+            == segment.flags
+        && columnText(row, 10) == segment.speakerEmbeddingModel
+        && static_cast<std::size_t>(sqlite3_column_int64(row, 11))
+            == segment.speakerEmbedding.size()
+        && sameEmbedding;
 }
 
 bool validDigest(const std::string &digest)
@@ -493,12 +718,26 @@ Expected<std::uint64_t> RecoveryJournal::appendFinalSegment(
     const std::string &sessionId,
     const TranscriptSegment &segment)
 {
+    auto copy = segment;
+    return appendFinalSegment(sessionId, copy);
+}
+
+Expected<std::uint64_t> RecoveryJournal::appendFinalSegment(
+    const std::string &sessionId,
+    TranscriptSegment &segment)
+{
     if ((segment.flags & LS_SEGMENT_FLAG_FINAL) == 0
         || segment.revision == 0 || segment.endTimeNs < segment.startTimeNs
         || !std::isfinite(segment.confidence)
-        || segment.confidence < 0.0F || segment.confidence > 1.0F) {
+        || segment.confidence < 0.0F || segment.confidence > 1.0F
+        || !validEmbedding(
+            segment.speakerEmbeddingModel,
+            segment.speakerEmbedding,
+            true)) {
         return Error{LS_INVALID_ARGUMENT, "final segment is invalid"};
     }
+
+    TranscriptSegment effectiveSegment = segment;
 
     std::lock_guard lock(mutex_);
     Transaction transaction(database_);
@@ -510,13 +749,49 @@ Expected<std::uint64_t> RecoveryJournal::appendFinalSegment(
         return session.error();
     }
 
-    Statement existing;
+    Statement enrollment;
     auto prepared = prepare(
+        database_,
+        R"SQL(
+SELECT e.profile_id, e.display_name
+FROM session_voice_profile_enrollments AS e
+WHERE e.session_id = ? AND e.original_speaker_id = ?
+)SQL",
+        enrollment);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(enrollment.get(), 1, sessionId);
+    sqlite3_bind_int64(
+        enrollment.get(),
+        2,
+        static_cast<sqlite3_int64>(segment.speakerId));
+    const int enrollmentStep = sqlite3_step(enrollment.get());
+    if (enrollmentStep == SQLITE_ROW) {
+        const auto profileId = static_cast<std::uint64_t>(
+            sqlite3_column_int64(enrollment.get(), 0));
+        const auto displayName = columnText(enrollment.get(), 1);
+        if (profileId == 0 || profileId > kSpeakerIdPayloadMask
+            || !validProfileName(displayName)) {
+            return Error{
+                LS_RECOVERY_ERROR,
+                "journal has an invalid speaker enrollment"};
+        }
+        effectiveSegment.speakerId = persistentSpeakerId(profileId);
+        effectiveSegment.speakerLabel = displayName;
+    } else if (enrollmentStep != SQLITE_DONE) {
+        return sqliteError(database_, "cannot inspect speaker enrollment");
+    }
+
+    Statement existing;
+    prepared = prepare(
         database_,
         R"SQL(
 SELECT stable_id, source_id, start_time_ns, end_time_ns, speaker_id,
        speaker_label, text, language, confidence, flags,
-       revision, journal_checkpoint
+       speaker_embedding_model, speaker_embedding_dimension,
+       speaker_embedding,
+       revision
 FROM segments
 WHERE session_id = ? AND stable_id = ?
 ORDER BY revision DESC
@@ -530,8 +805,8 @@ LIMIT 1
     sqlite3_bind_blob(
         existing.get(),
         2,
-        segment.stableId.data(),
-        static_cast<int>(segment.stableId.size()),
+        effectiveSegment.stableId.data(),
+        static_cast<int>(effectiveSegment.stableId.size()),
         SQLITE_TRANSIENT);
     const int existingStep = sqlite3_step(existing.get());
     if (existingStep != SQLITE_ROW && existingStep != SQLITE_DONE) {
@@ -539,21 +814,23 @@ LIMIT 1
     }
     if (existingStep == SQLITE_ROW) {
         const auto currentRevision =
-            static_cast<std::uint32_t>(sqlite3_column_int64(existing.get(), 10));
-        if (segment.revision < currentRevision) {
+            static_cast<std::uint32_t>(sqlite3_column_int64(existing.get(), 13));
+        if (effectiveSegment.revision < currentRevision) {
             return Error{
                 LS_CONFLICT,
                 "segment revision would move backwards"};
         }
-        if (segment.revision == currentRevision) {
-            if (!sameSegment(existing.get(), segment)) {
+        if (effectiveSegment.revision == currentRevision) {
+            if (!sameSegment(existing.get(), segment)
+                && !sameSegment(existing.get(), effectiveSegment)) {
                 return Error{
                     LS_CONFLICT,
                     "same segment revision has different content"};
             }
-            const auto checkpoint = static_cast<std::uint64_t>(
-                sqlite3_column_int64(existing.get(), 11));
-            return checkpoint;
+            effectiveSegment.journalCheckpoint =
+                session.value().journalCheckpoint;
+            segment = std::move(effectiveSegment);
+            return session.value().journalCheckpoint;
         }
     }
 
@@ -566,8 +843,9 @@ LIMIT 1
 INSERT INTO segments(
     session_id, stable_id, revision, source_id, start_time_ns, end_time_ns,
     speaker_id, speaker_label, text, language, confidence, flags,
-    journal_checkpoint
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    journal_checkpoint, speaker_embedding_model, speaker_embedding_dimension,
+    speaker_embedding
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 )SQL",
         insert);
     if (!prepared) {
@@ -577,29 +855,35 @@ INSERT INTO segments(
     sqlite3_bind_blob(
         insert.get(),
         2,
-        segment.stableId.data(),
-        static_cast<int>(segment.stableId.size()),
+        effectiveSegment.stableId.data(),
+        static_cast<int>(effectiveSegment.stableId.size()),
         SQLITE_TRANSIENT);
-    sqlite3_bind_int64(insert.get(), 3, segment.revision);
+    sqlite3_bind_int64(insert.get(), 3, effectiveSegment.revision);
     sqlite3_bind_int64(
         insert.get(),
         4,
-        static_cast<sqlite3_int64>(segment.sourceId));
-    sqlite3_bind_int64(insert.get(), 5, segment.startTimeNs);
-    sqlite3_bind_int64(insert.get(), 6, segment.endTimeNs);
+        static_cast<sqlite3_int64>(effectiveSegment.sourceId));
+    sqlite3_bind_int64(insert.get(), 5, effectiveSegment.startTimeNs);
+    sqlite3_bind_int64(insert.get(), 6, effectiveSegment.endTimeNs);
     sqlite3_bind_int64(
         insert.get(),
         7,
-        static_cast<sqlite3_int64>(segment.speakerId));
-    bindText(insert.get(), 8, segment.speakerLabel);
-    bindText(insert.get(), 9, segment.text);
-    bindText(insert.get(), 10, segment.language);
-    sqlite3_bind_double(insert.get(), 11, segment.confidence);
-    sqlite3_bind_int64(insert.get(), 12, segment.flags);
+        static_cast<sqlite3_int64>(effectiveSegment.speakerId));
+    bindText(insert.get(), 8, effectiveSegment.speakerLabel);
+    bindText(insert.get(), 9, effectiveSegment.text);
+    bindText(insert.get(), 10, effectiveSegment.language);
+    sqlite3_bind_double(insert.get(), 11, effectiveSegment.confidence);
+    sqlite3_bind_int64(insert.get(), 12, effectiveSegment.flags);
     sqlite3_bind_int64(
         insert.get(),
         13,
         static_cast<sqlite3_int64>(checkpoint));
+    bindText(insert.get(), 14, effectiveSegment.speakerEmbeddingModel);
+    sqlite3_bind_int64(
+        insert.get(),
+        15,
+        static_cast<sqlite3_int64>(effectiveSegment.speakerEmbedding.size()));
+    bindEmbedding(insert.get(), 16, effectiveSegment.speakerEmbedding);
     if (auto stepped = stepDone(database_, insert.get()); !stepped) {
         return stepped.error();
     }
@@ -621,9 +905,9 @@ INSERT INTO segments(
         update.get(),
         1,
         static_cast<sqlite3_int64>(checkpoint));
-    sqlite3_bind_int64(update.get(), 2, segment.revision);
-    sqlite3_bind_int64(update.get(), 3, segment.startTimeNs);
-    sqlite3_bind_int64(update.get(), 4, segment.startTimeNs);
+    sqlite3_bind_int64(update.get(), 2, effectiveSegment.revision);
+    sqlite3_bind_int64(update.get(), 3, effectiveSegment.startTimeNs);
+    sqlite3_bind_int64(update.get(), 4, effectiveSegment.startTimeNs);
     bindText(update.get(), 5, sessionId);
     if (auto stepped = stepDone(database_, update.get()); !stepped) {
         return stepped.error();
@@ -631,6 +915,8 @@ INSERT INTO segments(
     if (auto committed = transaction.commit(); !committed) {
         return committed.error();
     }
+    effectiveSegment.journalCheckpoint = checkpoint;
+    segment = std::move(effectiveSegment);
     return checkpoint;
 }
 
@@ -942,8 +1228,13 @@ RecoveryJournal::snapshot(const std::string &sessionId)
 SELECT
     s.stable_id, s.source_id, s.start_time_ns, s.end_time_ns, s.speaker_id,
     s.speaker_label, s.text, s.language, s.confidence, s.revision, s.flags,
-    s.journal_checkpoint
+    s.journal_checkpoint, s.speaker_embedding_model,
+    s.speaker_embedding_dimension, s.speaker_embedding,
+    enrollment.profile_id, enrollment.display_name
 FROM segments AS s
+LEFT JOIN session_voice_profile_enrollments AS enrollment
+  ON enrollment.session_id = s.session_id
+ AND enrollment.original_speaker_id = s.speaker_id
 WHERE s.session_id = ?
   AND (s.flags & ?) != 0
   AND NOT EXISTS (
@@ -987,6 +1278,36 @@ ORDER BY s.start_time_ns, s.end_time_ns, s.source_id, hex(s.stable_id)
             sqlite3_column_int64(segments.get(), 10));
         segment.journalCheckpoint = static_cast<std::uint64_t>(
             sqlite3_column_int64(segments.get(), 11));
+        segment.speakerEmbeddingModel = columnText(segments.get(), 12);
+        const auto embedding = decodeEmbedding(segments.get(), 14, true);
+        if (!embedding
+            || static_cast<std::size_t>(
+                   sqlite3_column_int64(segments.get(), 13))
+                != embedding.value().size()
+            || !validEmbedding(
+                segment.speakerEmbeddingModel,
+                embedding.value(),
+                true)) {
+            rollback();
+            return Error{
+                LS_RECOVERY_ERROR,
+                "journal has inconsistent segment speaker evidence"};
+        }
+        segment.speakerEmbedding = embedding.value();
+        if (sqlite3_column_type(segments.get(), 15) != SQLITE_NULL) {
+            const auto profileId = static_cast<std::uint64_t>(
+                sqlite3_column_int64(segments.get(), 15));
+            const auto displayName = columnText(segments.get(), 16);
+            if (profileId == 0 || profileId > kSpeakerIdPayloadMask
+                || !validProfileName(displayName)) {
+                rollback();
+                return Error{
+                    LS_RECOVERY_ERROR,
+                    "journal has an invalid speaker enrollment"};
+            }
+            segment.speakerId = persistentSpeakerId(profileId);
+            segment.speakerLabel = displayName;
+        }
         result.segments.push_back(std::move(segment));
     }
     if (step != SQLITE_DONE) {
@@ -1000,6 +1321,838 @@ ORDER BY s.start_time_ns, s.end_time_ns, s.source_id, hex(s.stable_id)
     }
     active = false;
     return result;
+}
+
+Expected<VoiceProfile>
+RecoveryJournal::loadVoiceProfileLocked(std::uint64_t profileId)
+{
+    if (profileId == 0 || profileId > kSpeakerIdPayloadMask) {
+        return Error{LS_INVALID_ARGUMENT, "voice profile ID is invalid"};
+    }
+
+    Statement statement;
+    auto prepared = prepare(
+        database_,
+        R"SQL(
+SELECT profile_id, display_name, embedding_model_id, embedding_dimension,
+       centroid, observation_count, created_at_unix_ns, updated_at_unix_ns
+FROM voice_profiles
+WHERE profile_id = ?
+)SQL",
+        statement);
+    if (!prepared) {
+        return prepared.error();
+    }
+    sqlite3_bind_int64(
+        statement.get(),
+        1,
+        static_cast<sqlite3_int64>(profileId));
+    const int step = sqlite3_step(statement.get());
+    if (step == SQLITE_DONE) {
+        return Error{LS_NOT_FOUND, "voice profile was not found"};
+    }
+    if (step != SQLITE_ROW) {
+        return sqliteError(database_, "cannot load voice profile");
+    }
+
+    VoiceProfile profile;
+    profile.profileId = static_cast<std::uint64_t>(
+        sqlite3_column_int64(statement.get(), 0));
+    profile.displayName = columnText(statement.get(), 1);
+    profile.embeddingModelId = columnText(statement.get(), 2);
+    const auto dimension = static_cast<std::size_t>(
+        sqlite3_column_int64(statement.get(), 3));
+    auto centroid = decodeEmbedding(statement.get(), 4, false);
+    profile.observationCount = static_cast<std::uint64_t>(
+        sqlite3_column_int64(statement.get(), 5));
+    profile.createdAtUnixNs = sqlite3_column_int64(statement.get(), 6);
+    profile.updatedAtUnixNs = sqlite3_column_int64(statement.get(), 7);
+    if (!centroid || profile.profileId != profileId
+        || !validProfileName(profile.displayName)
+        || profile.embeddingModelId.empty()
+        || profile.embeddingModelId.size() > 256
+        || dimension == 0 || dimension > kMaximumEmbeddingDimensions
+        || centroid.value().size() != dimension
+        || profile.observationCount == 0
+        || profile.createdAtUnixNs < 0
+        || profile.updatedAtUnixNs < profile.createdAtUnixNs
+        || !normalizeEmbedding(centroid.value())) {
+        return Error{LS_RECOVERY_ERROR, "voice profile is invalid"};
+    }
+    profile.centroid = centroid.takeValue();
+
+    Statement prototypes;
+    prepared = prepare(
+        database_,
+        R"SQL(
+SELECT embedding_dimension, embedding
+FROM voice_profile_prototypes
+WHERE profile_id = ?
+ORDER BY prototype_index
+)SQL",
+        prototypes);
+    if (!prepared) {
+        return prepared.error();
+    }
+    sqlite3_bind_int64(
+        prototypes.get(),
+        1,
+        static_cast<sqlite3_int64>(profileId));
+    int prototypeStep = SQLITE_ROW;
+    while ((prototypeStep = sqlite3_step(prototypes.get())) == SQLITE_ROW) {
+        if (profile.prototypes.size() >= kMaximumProfilePrototypes
+            || static_cast<std::size_t>(
+                   sqlite3_column_int64(prototypes.get(), 0))
+                != dimension) {
+            return Error{
+                LS_RECOVERY_ERROR,
+                "voice profile prototype is invalid"};
+        }
+        auto prototype = decodeEmbedding(prototypes.get(), 1, false);
+        if (!prototype || prototype.value().size() != dimension
+            || !normalizeEmbedding(prototype.value())) {
+            return Error{
+                LS_RECOVERY_ERROR,
+                "voice profile prototype is invalid"};
+        }
+        profile.prototypes.push_back(prototype.takeValue());
+    }
+    if (prototypeStep != SQLITE_DONE) {
+        return sqliteError(database_, "cannot load voice profile prototypes");
+    }
+    if (profile.prototypes.empty()) {
+        profile.prototypes.push_back(profile.centroid);
+    }
+    return profile;
+}
+
+Expected<std::vector<VoiceProfile>> RecoveryJournal::listVoiceProfiles()
+{
+    std::lock_guard lock(mutex_);
+    Statement statement;
+    auto prepared = prepare(
+        database_,
+        "SELECT profile_id FROM voice_profiles ORDER BY profile_id LIMIT 1025",
+        statement);
+    if (!prepared) {
+        return prepared.error();
+    }
+
+    std::vector<VoiceProfile> result;
+    int step = SQLITE_ROW;
+    while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+        if (result.size() >= kMaximumVoiceProfiles) {
+            break;
+        }
+        const auto profileId = static_cast<std::uint64_t>(
+            sqlite3_column_int64(statement.get(), 0));
+        auto profile = loadVoiceProfileLocked(profileId);
+        if (profile) {
+            result.push_back(profile.takeValue());
+        } else if (profile.error().code != LS_RECOVERY_ERROR) {
+            return profile.error();
+        }
+    }
+    if (step != SQLITE_DONE && result.size() < kMaximumVoiceProfiles) {
+        return sqliteError(database_, "cannot list voice profiles");
+    }
+    return result;
+}
+
+Expected<VoiceProfileEnrollment> RecoveryJournal::enrollVoiceProfile(
+    const std::string &sessionId,
+    std::uint64_t speakerId,
+    const std::string &displayName)
+{
+    const auto namespaceBits =
+        speakerId & (kAnonymousSpeakerFlag | kPersistentSpeakerFlag);
+    const bool anonymous = namespaceBits == kAnonymousSpeakerFlag
+        && (speakerId & kSpeakerIdPayloadMask) != 0;
+    const bool persistent = isPersistentSpeakerId(speakerId)
+        && profileIdFromSpeakerId(speakerId) != 0;
+    if (!validSessionId(sessionId) || !validProfileName(displayName)
+        || speakerId == 0 || speakerId == 1
+        || (!anonymous && !persistent)) {
+        return Error{
+            LS_INVALID_ARGUMENT,
+            "voice profile enrollment is invalid"};
+    }
+
+    std::lock_guard lock(mutex_);
+    Transaction transaction(database_);
+    if (!transaction.active()) {
+        return sqliteError(database_, "cannot begin voice profile enrollment");
+    }
+    auto session = loadSessionLocked(sessionId);
+    if (!session) {
+        return session.error();
+    }
+    if (equalNameCaseInsensitive(displayName, "Me")
+        || equalNameCaseInsensitive(
+            displayName,
+            session.value().localSpeakerName)) {
+        return Error{
+            LS_INVALID_ARGUMENT,
+            "voice profile name is reserved for the local speaker"};
+    }
+
+    std::optional<std::uint64_t> mappedProfileId;
+    std::optional<std::string> mappedDisplayName;
+    Statement mapped;
+    auto prepared = prepare(
+        database_,
+        "SELECT profile_id, display_name "
+        "FROM session_voice_profile_enrollments "
+        "WHERE session_id = ? AND original_speaker_id = ?",
+        mapped);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(mapped.get(), 1, sessionId);
+    sqlite3_bind_int64(
+        mapped.get(),
+        2,
+        static_cast<sqlite3_int64>(speakerId));
+    int step = sqlite3_step(mapped.get());
+    if (step == SQLITE_ROW) {
+        mappedProfileId = static_cast<std::uint64_t>(
+            sqlite3_column_int64(mapped.get(), 0));
+        mappedDisplayName = columnText(mapped.get(), 1);
+        if (*mappedProfileId == 0
+            || *mappedProfileId > kSpeakerIdPayloadMask
+            || !validProfileName(*mappedDisplayName)) {
+            return Error{
+                LS_RECOVERY_ERROR,
+                "journal has an invalid speaker enrollment"};
+        }
+    } else if (step != SQLITE_DONE) {
+        return sqliteError(database_, "cannot inspect voice profile enrollment");
+    }
+
+    std::optional<VoiceProfile> existingProfile;
+    if (isPersistentSpeakerId(speakerId)) {
+        const auto profileId = profileIdFromSpeakerId(speakerId);
+        if (mappedProfileId.has_value()
+            && *mappedProfileId != profileId) {
+            return Error{
+                LS_CONFLICT,
+                "session speaker is enrolled into another profile"};
+        }
+        auto loaded = loadVoiceProfileLocked(profileId);
+        if (!loaded) {
+            return loaded.error();
+        }
+        existingProfile = loaded.takeValue();
+    } else if (mappedProfileId.has_value()) {
+        auto loaded = loadVoiceProfileLocked(*mappedProfileId);
+        if (!loaded) {
+            return loaded.error();
+        }
+        existingProfile = loaded.takeValue();
+    } else {
+        Statement byName;
+        prepared = prepare(
+            database_,
+            "SELECT profile_id FROM voice_profiles "
+            "WHERE display_name = ? COLLATE NOCASE",
+            byName);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(byName.get(), 1, displayName);
+        step = sqlite3_step(byName.get());
+        if (step == SQLITE_ROW) {
+            const auto profileId = static_cast<std::uint64_t>(
+                sqlite3_column_int64(byName.get(), 0));
+            auto loaded = loadVoiceProfileLocked(profileId);
+            if (!loaded) {
+                return loaded.error();
+            }
+            existingProfile = loaded.takeValue();
+        } else if (step != SQLITE_DONE) {
+            return sqliteError(database_, "cannot find voice profile by name");
+        }
+    }
+    if (existingProfile.has_value()
+        && !equalNameCaseInsensitive(
+            existingProfile->displayName,
+            displayName)) {
+        return Error{
+            LS_CONFLICT,
+            "speaker ID belongs to a differently named voice profile"};
+    }
+
+    const std::uint64_t effectiveSpeakerId = existingProfile.has_value()
+        ? persistentSpeakerId(existingProfile->profileId)
+        : 0;
+    Statement segments;
+    prepared = prepare(
+        database_,
+        R"SQL(
+SELECT
+    s.stable_id, s.source_id, s.start_time_ns, s.end_time_ns, s.speaker_id,
+    s.speaker_label, s.text, s.language, s.confidence, s.revision, s.flags,
+    s.journal_checkpoint, s.speaker_embedding_model,
+    s.speaker_embedding_dimension, s.speaker_embedding
+FROM segments AS s
+WHERE s.session_id = ?
+  AND (s.speaker_id = ? OR (? != 0 AND s.speaker_id = ?))
+  AND (s.flags & ?) != 0
+  AND NOT EXISTS (
+      SELECT 1 FROM segments AS newer
+      WHERE newer.session_id = s.session_id
+        AND newer.stable_id = s.stable_id
+        AND newer.revision > s.revision
+  )
+ORDER BY s.start_time_ns, s.end_time_ns, hex(s.stable_id)
+)SQL",
+        segments);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(segments.get(), 1, sessionId);
+    sqlite3_bind_int64(
+        segments.get(),
+        2,
+        static_cast<sqlite3_int64>(speakerId));
+    sqlite3_bind_int64(
+        segments.get(),
+        3,
+        static_cast<sqlite3_int64>(effectiveSpeakerId));
+    sqlite3_bind_int64(
+        segments.get(),
+        4,
+        static_cast<sqlite3_int64>(effectiveSpeakerId));
+    sqlite3_bind_int(segments.get(), 5, LS_SEGMENT_FLAG_FINAL);
+
+    std::vector<TranscriptSegment> sourceSegments;
+    while ((step = sqlite3_step(segments.get())) == SQLITE_ROW) {
+        TranscriptSegment segment;
+        const auto *stable = static_cast<const std::uint8_t *>(
+            sqlite3_column_blob(segments.get(), 0));
+        if (stable == nullptr || sqlite3_column_bytes(segments.get(), 0) != 16) {
+            return Error{LS_RECOVERY_ERROR, "journal has invalid stable ID"};
+        }
+        std::copy_n(stable, 16, segment.stableId.begin());
+        segment.sourceId = static_cast<std::uint64_t>(
+            sqlite3_column_int64(segments.get(), 1));
+        segment.startTimeNs = sqlite3_column_int64(segments.get(), 2);
+        segment.endTimeNs = sqlite3_column_int64(segments.get(), 3);
+        segment.speakerId = static_cast<std::uint64_t>(
+            sqlite3_column_int64(segments.get(), 4));
+        segment.speakerLabel = columnText(segments.get(), 5);
+        segment.text = columnText(segments.get(), 6);
+        segment.language = columnText(segments.get(), 7);
+        segment.confidence = static_cast<float>(
+            sqlite3_column_double(segments.get(), 8));
+        segment.revision = static_cast<std::uint32_t>(
+            sqlite3_column_int64(segments.get(), 9));
+        segment.flags = static_cast<std::uint32_t>(
+            sqlite3_column_int64(segments.get(), 10));
+        segment.journalCheckpoint = static_cast<std::uint64_t>(
+            sqlite3_column_int64(segments.get(), 11));
+        segment.speakerEmbeddingModel = columnText(segments.get(), 12);
+        auto embedding = decodeEmbedding(segments.get(), 14, true);
+        const auto dimension = static_cast<std::size_t>(
+            sqlite3_column_int64(segments.get(), 13));
+        if (!embedding || embedding.value().size() != dimension
+            || !validEmbedding(
+                segment.speakerEmbeddingModel,
+                embedding.value(),
+                true)) {
+            return Error{
+                LS_RECOVERY_ERROR,
+                "journal has inconsistent segment speaker evidence"};
+        }
+        if (segment.sourceId != session.value().systemAudioSourceId) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "only remote system-audio speakers can be enrolled"};
+        }
+        segment.speakerEmbedding = embedding.takeValue();
+        sourceSegments.push_back(std::move(segment));
+    }
+    if (step != SQLITE_DONE) {
+        return sqliteError(database_, "cannot load speaker enrollment evidence");
+    }
+    if (sourceSegments.empty()) {
+        return Error{LS_NOT_FOUND, "session speaker was not found"};
+    }
+
+    std::string embeddingModelId;
+    std::size_t embeddingDimension = 0;
+    for (const auto &segment : sourceSegments) {
+        if (segment.speakerEmbedding.empty()) {
+            continue;
+        }
+        if (embeddingModelId.empty()) {
+            embeddingModelId = segment.speakerEmbeddingModel;
+            embeddingDimension = segment.speakerEmbedding.size();
+        } else if (embeddingModelId != segment.speakerEmbeddingModel
+                   || embeddingDimension != segment.speakerEmbedding.size()) {
+            return Error{
+                LS_CONFLICT,
+                "session speaker has incompatible embedding models"};
+        }
+    }
+    if (embeddingModelId.empty()) {
+        return Error{
+            LS_NOT_FOUND,
+            "session speaker has no stable voice evidence"};
+    }
+    if (existingProfile.has_value()
+        && (existingProfile->embeddingModelId != embeddingModelId
+            || existingProfile->centroid.size() != embeddingDimension)) {
+        return Error{
+            LS_CONFLICT,
+            "voice profile uses an incompatible embedding model"};
+    }
+
+    std::vector<std::pair<StableId, std::vector<float>>> newEvidence;
+    for (const auto &segment : sourceSegments) {
+        if (segment.speakerEmbedding.empty()) {
+            continue;
+        }
+        if (existingProfile.has_value()) {
+            Statement observed;
+            prepared = prepare(
+                database_,
+                "SELECT 1 FROM voice_profile_observations "
+                "WHERE profile_id = ? AND session_id = ? AND stable_id = ?",
+                observed);
+            if (!prepared) {
+                return prepared.error();
+            }
+            sqlite3_bind_int64(
+                observed.get(),
+                1,
+                static_cast<sqlite3_int64>(existingProfile->profileId));
+            bindText(observed.get(), 2, sessionId);
+            sqlite3_bind_blob(
+                observed.get(),
+                3,
+                segment.stableId.data(),
+                static_cast<int>(segment.stableId.size()),
+                SQLITE_TRANSIENT);
+            const int observedStep = sqlite3_step(observed.get());
+            if (observedStep == SQLITE_ROW) {
+                continue;
+            }
+            if (observedStep != SQLITE_DONE) {
+                return sqliteError(
+                    database_,
+                    "cannot inspect voice profile observation");
+            }
+        }
+        auto normalized = segment.speakerEmbedding;
+        if (!normalizeEmbedding(normalized)) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "session speaker has unusable voice evidence"};
+        }
+        newEvidence.emplace_back(segment.stableId, std::move(normalized));
+    }
+    if (!existingProfile.has_value() && newEvidence.empty()) {
+        return Error{
+            LS_NOT_FOUND,
+            "session speaker has no new voice evidence"};
+    }
+
+    VoiceProfile profile;
+    bool profileNameChanged = false;
+    if (existingProfile.has_value()) {
+        profile = *existingProfile;
+        profileNameChanged = profile.displayName != displayName;
+        profile.displayName = displayName;
+    } else {
+        profile.displayName = displayName;
+        profile.embeddingModelId = embeddingModelId;
+        profile.centroid.assign(embeddingDimension, 0.0F);
+        profile.createdAtUnixNs = unixTimeNs();
+        profile.updatedAtUnixNs = profile.createdAtUnixNs;
+    }
+
+    if (!newEvidence.empty()) {
+        std::vector<long double> aggregate(embeddingDimension, 0.0L);
+        if (profile.observationCount != 0) {
+            for (std::size_t index = 0; index < embeddingDimension; ++index) {
+                aggregate[index] = static_cast<long double>(
+                    profile.centroid[index])
+                    * static_cast<long double>(profile.observationCount);
+            }
+        }
+        for (const auto &[stableId, values] : newEvidence) {
+            (void)stableId;
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                aggregate[index] += values[index];
+            }
+            const bool distinct = std::all_of(
+                profile.prototypes.begin(),
+                profile.prototypes.end(),
+                [&](const std::vector<float> &prototype) {
+                    return cosineSimilarity(values, prototype) < 0.995F;
+                });
+            if (distinct
+                && profile.prototypes.size() < kMaximumProfilePrototypes) {
+                profile.prototypes.push_back(values);
+            }
+        }
+        profile.centroid.resize(embeddingDimension);
+        for (std::size_t index = 0; index < embeddingDimension; ++index) {
+            profile.centroid[index] = static_cast<float>(aggregate[index]);
+        }
+        if (!normalizeEmbedding(profile.centroid)) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "voice evidence cannot form a stable profile"};
+        }
+        if (profile.prototypes.empty()) {
+            profile.prototypes.push_back(profile.centroid);
+        }
+        constexpr auto kMaximumObservationCount =
+            static_cast<std::uint64_t>(
+                std::numeric_limits<sqlite3_int64>::max());
+        if (newEvidence.size() > kMaximumObservationCount
+            || profile.observationCount
+                > kMaximumObservationCount - newEvidence.size()) {
+            return Error{LS_CONFLICT, "voice profile observation count overflow"};
+        }
+        profile.observationCount += newEvidence.size();
+        profile.updatedAtUnixNs = std::max(
+            unixTimeNs(),
+            profile.createdAtUnixNs);
+    }
+
+    if (!existingProfile.has_value()) {
+        Statement insertProfile;
+        prepared = prepare(
+            database_,
+            R"SQL(
+INSERT INTO voice_profiles(
+    display_name, embedding_model_id, embedding_dimension, centroid,
+    observation_count, created_at_unix_ns, updated_at_unix_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+)SQL",
+            insertProfile);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(insertProfile.get(), 1, profile.displayName);
+        bindText(insertProfile.get(), 2, profile.embeddingModelId);
+        sqlite3_bind_int64(
+            insertProfile.get(),
+            3,
+            static_cast<sqlite3_int64>(profile.centroid.size()));
+        bindEmbedding(insertProfile.get(), 4, profile.centroid);
+        sqlite3_bind_int64(
+            insertProfile.get(),
+            5,
+            static_cast<sqlite3_int64>(profile.observationCount));
+        sqlite3_bind_int64(insertProfile.get(), 6, profile.createdAtUnixNs);
+        sqlite3_bind_int64(insertProfile.get(), 7, profile.updatedAtUnixNs);
+        const int inserted = sqlite3_step(insertProfile.get());
+        if (inserted == SQLITE_CONSTRAINT) {
+            return Error{LS_CONFLICT, "voice profile name already exists"};
+        }
+        if (inserted != SQLITE_DONE) {
+            return sqliteError(database_, "cannot create voice profile");
+        }
+        profile.profileId = static_cast<std::uint64_t>(
+            sqlite3_last_insert_rowid(database_));
+        if (profile.profileId == 0
+            || profile.profileId > kSpeakerIdPayloadMask) {
+            return Error{LS_CONFLICT, "voice profile ID space is exhausted"};
+        }
+    } else if (!newEvidence.empty() || profileNameChanged) {
+        if (profileNameChanged && newEvidence.empty()) {
+            profile.updatedAtUnixNs = std::max(
+                unixTimeNs(),
+                profile.createdAtUnixNs);
+        }
+        Statement updateProfile;
+        prepared = prepare(
+            database_,
+            R"SQL(
+UPDATE voice_profiles
+SET display_name = ?, centroid = ?, observation_count = ?,
+    updated_at_unix_ns = ?
+WHERE profile_id = ?
+)SQL",
+            updateProfile);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(updateProfile.get(), 1, profile.displayName);
+        bindEmbedding(updateProfile.get(), 2, profile.centroid);
+        sqlite3_bind_int64(
+            updateProfile.get(),
+            3,
+            static_cast<sqlite3_int64>(profile.observationCount));
+        sqlite3_bind_int64(
+            updateProfile.get(),
+            4,
+            profile.updatedAtUnixNs);
+        sqlite3_bind_int64(
+            updateProfile.get(),
+            5,
+            static_cast<sqlite3_int64>(profile.profileId));
+        const int updated = sqlite3_step(updateProfile.get());
+        if (updated == SQLITE_CONSTRAINT) {
+            return Error{LS_CONFLICT, "voice profile name already exists"};
+        }
+        if (updated != SQLITE_DONE) {
+            return sqliteError(database_, "cannot update voice profile");
+        }
+    }
+
+    if (!newEvidence.empty()) {
+        Statement clearPrototypes;
+        prepared = prepare(
+            database_,
+            "DELETE FROM voice_profile_prototypes WHERE profile_id = ?",
+            clearPrototypes);
+        if (!prepared) {
+            return prepared.error();
+        }
+        sqlite3_bind_int64(
+            clearPrototypes.get(),
+            1,
+            static_cast<sqlite3_int64>(profile.profileId));
+        if (auto cleared = stepDone(database_, clearPrototypes.get()); !cleared) {
+            return cleared.error();
+        }
+        for (std::size_t index = 0; index < profile.prototypes.size(); ++index) {
+            Statement insertPrototype;
+            prepared = prepare(
+                database_,
+                R"SQL(
+INSERT INTO voice_profile_prototypes(
+    profile_id, prototype_index, embedding_dimension, embedding
+) VALUES (?, ?, ?, ?)
+)SQL",
+                insertPrototype);
+            if (!prepared) {
+                return prepared.error();
+            }
+            sqlite3_bind_int64(
+                insertPrototype.get(),
+                1,
+                static_cast<sqlite3_int64>(profile.profileId));
+            sqlite3_bind_int64(
+                insertPrototype.get(),
+                2,
+                static_cast<sqlite3_int64>(index));
+            sqlite3_bind_int64(
+                insertPrototype.get(),
+                3,
+                static_cast<sqlite3_int64>(embeddingDimension));
+            bindEmbedding(
+                insertPrototype.get(),
+                4,
+                profile.prototypes[index]);
+            if (auto inserted = stepDone(database_, insertPrototype.get());
+                !inserted) {
+                return inserted.error();
+            }
+        }
+
+        for (const auto &[stableId, values] : newEvidence) {
+            (void)values;
+            Statement observation;
+            prepared = prepare(
+                database_,
+                R"SQL(
+INSERT OR IGNORE INTO voice_profile_observations(
+    profile_id, session_id, stable_id
+) VALUES (?, ?, ?)
+)SQL",
+                observation);
+            if (!prepared) {
+                return prepared.error();
+            }
+            sqlite3_bind_int64(
+                observation.get(),
+                1,
+                static_cast<sqlite3_int64>(profile.profileId));
+            bindText(observation.get(), 2, sessionId);
+            sqlite3_bind_blob(
+                observation.get(),
+                3,
+                stableId.data(),
+                static_cast<int>(stableId.size()),
+                SQLITE_TRANSIENT);
+            if (auto inserted = stepDone(database_, observation.get());
+                !inserted) {
+                return inserted.error();
+            }
+        }
+    }
+
+    bool insertedMapping = false;
+    if (!mappedProfileId.has_value()) {
+        Statement insertMapping;
+        prepared = prepare(
+            database_,
+            R"SQL(
+INSERT INTO session_voice_profile_enrollments(
+    session_id, original_speaker_id, profile_id, display_name
+) VALUES (?, ?, ?, ?)
+)SQL",
+            insertMapping);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(insertMapping.get(), 1, sessionId);
+        sqlite3_bind_int64(
+            insertMapping.get(),
+            2,
+            static_cast<sqlite3_int64>(speakerId));
+        sqlite3_bind_int64(
+            insertMapping.get(),
+            3,
+            static_cast<sqlite3_int64>(profile.profileId));
+        bindText(insertMapping.get(), 4, profile.displayName);
+        if (auto inserted = stepDone(database_, insertMapping.get()); !inserted) {
+            return inserted.error();
+        }
+        insertedMapping = true;
+    } else if (*mappedProfileId != profile.profileId) {
+        return Error{
+            LS_CONFLICT,
+            "session speaker is enrolled into another voice profile"};
+    }
+
+    const std::uint64_t persistedSpeakerId =
+        persistentSpeakerId(profile.profileId);
+    std::uint32_t relabeledSegments = 0;
+    if (insertedMapping) {
+        for (const auto &source : sourceSegments) {
+            if (source.speakerId == persistedSpeakerId
+                && source.speakerLabel == profile.displayName) {
+                continue;
+            }
+            if (relabeledSegments
+                == std::numeric_limits<std::uint32_t>::max()) {
+                return Error{
+                    LS_CONFLICT,
+                    "too many segments are affected by voice enrollment"};
+            }
+            ++relabeledSegments;
+        }
+    }
+
+    if (insertedMapping
+        && session.value().journalCheckpoint
+            == std::numeric_limits<std::uint64_t>::max()) {
+        return Error{LS_CONFLICT, "journal checkpoint space is exhausted"};
+    }
+    const std::uint64_t checkpoint = insertedMapping
+        ? session.value().journalCheckpoint + 1u
+        : session.value().journalCheckpoint;
+    if (insertedMapping) {
+        Statement updateSession;
+        prepared = prepare(
+            database_,
+            "UPDATE sessions SET journal_checkpoint = ? WHERE session_id = ?",
+            updateSession);
+        if (!prepared) {
+            return prepared.error();
+        }
+        sqlite3_bind_int64(
+            updateSession.get(),
+            1,
+            static_cast<sqlite3_int64>(checkpoint));
+        bindText(updateSession.get(), 2, sessionId);
+        if (auto updated = stepDone(database_, updateSession.get()); !updated) {
+            return updated.error();
+        }
+    }
+    if (auto committed = transaction.commit(); !committed) {
+        return committed.error();
+    }
+
+    VoiceProfileEnrollment enrollment;
+    enrollment.profile = std::move(profile);
+    enrollment.speakerId = persistedSpeakerId;
+    enrollment.relabeledSegments = relabeledSegments;
+    enrollment.journalCheckpoint = checkpoint;
+    enrollment.highestSegmentRevision =
+        session.value().highestSegmentRevision;
+    return enrollment;
+}
+
+Expected<void> RecoveryJournal::renameVoiceProfile(
+    std::uint64_t profileId,
+    const std::string &displayName)
+{
+    if (profileId == 0 || profileId > kSpeakerIdPayloadMask
+        || !validProfileName(displayName)
+        || equalNameCaseInsensitive(displayName, "Me")) {
+        return Error{LS_INVALID_ARGUMENT, "voice profile name or ID is invalid"};
+    }
+    std::lock_guard lock(mutex_);
+    Transaction transaction(database_);
+    if (!transaction.active()) {
+        return sqliteError(database_, "cannot begin voice profile rename");
+    }
+
+    Statement update;
+    auto prepared = prepare(
+        database_,
+        "UPDATE voice_profiles SET display_name = ?, updated_at_unix_ns = ? "
+        "WHERE profile_id = ?",
+        update);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(update.get(), 1, displayName);
+    sqlite3_bind_int64(update.get(), 2, unixTimeNs());
+    sqlite3_bind_int64(
+        update.get(),
+        3,
+        static_cast<sqlite3_int64>(profileId));
+    const int updated = sqlite3_step(update.get());
+    if (updated == SQLITE_CONSTRAINT) {
+        return Error{LS_CONFLICT, "voice profile name already exists"};
+    }
+    if (updated != SQLITE_DONE) {
+        return sqliteError(database_, "cannot rename voice profile");
+    }
+    if (sqlite3_changes(database_) != 1) {
+        return Error{LS_NOT_FOUND, "voice profile was not found"};
+    }
+    return transaction.commit();
+}
+
+Expected<void> RecoveryJournal::deleteVoiceProfile(std::uint64_t profileId)
+{
+    if (profileId == 0 || profileId > kSpeakerIdPayloadMask) {
+        return Error{LS_INVALID_ARGUMENT, "voice profile ID is invalid"};
+    }
+    std::lock_guard lock(mutex_);
+    Transaction transaction(database_);
+    if (!transaction.active()) {
+        return sqliteError(database_, "cannot begin voice profile deletion");
+    }
+    Statement statement;
+    auto prepared = prepare(
+        database_,
+        "DELETE FROM voice_profiles WHERE profile_id = ?",
+        statement);
+    if (!prepared) {
+        return prepared.error();
+    }
+    sqlite3_bind_int64(
+        statement.get(),
+        1,
+        static_cast<sqlite3_int64>(profileId));
+    if (auto stepped = stepDone(database_, statement.get()); !stepped) {
+        return stepped.error();
+    }
+    if (sqlite3_changes(database_) != 1) {
+        return Error{LS_NOT_FOUND, "voice profile was not found"};
+    }
+    return transaction.commit();
 }
 
 Expected<void> RecoveryJournal::acknowledgePublication(

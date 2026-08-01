@@ -94,6 +94,39 @@ struct CoreRenderedMarkdown: Sendable, Equatable {
     let highestSegmentRevision: UInt32
 }
 
+struct CoreVoiceProfile: Sendable, Equatable, Identifiable {
+    let profileID: UInt64
+    let displayName: String
+    let sampleCount: UInt64
+
+    var id: UInt64 { profileID }
+}
+
+struct CoreVoiceProfileEnrollment: Sendable, Equatable {
+    let profileID: UInt64
+    let speakerID: UInt64
+    let sampleCount: UInt64
+    let relabeledSegments: UInt32
+    let journalCheckpoint: UInt64
+    let highestSegmentRevision: UInt32
+}
+
+struct LatestRequestGeneration: Sendable {
+    private var current: UInt64 = 0
+
+    mutating func advance() -> UInt64 {
+        current &+= 1
+        if current == 0 {
+            current = 1
+        }
+        return current
+    }
+
+    func isCurrent(_ generation: UInt64) -> Bool {
+        generation != 0 && generation == current
+    }
+}
+
 struct CoreTranscriptSegment: Sendable, Equatable {
     let stableID: UUID
     let sourceID: UInt64
@@ -161,6 +194,37 @@ protocol CoreClientProtocol: Sendable {
 
     func recoverableSessionIDs() throws -> [String]
     func openRecoverableSession(id: String) throws -> any CoreSessionProtocol
+    func listVoiceProfiles() throws -> [CoreVoiceProfile]
+    func enrollVoiceProfile(
+        sessionID: UUID,
+        speakerID: UInt64,
+        displayName: String
+    ) throws -> CoreVoiceProfileEnrollment
+    func renameVoiceProfile(profileID: UInt64, displayName: String) throws
+    func deleteVoiceProfile(profileID: UInt64) throws
+}
+
+extension CoreClientProtocol {
+    func listVoiceProfiles() throws -> [CoreVoiceProfile] { [] }
+
+    func enrollVoiceProfile(
+        sessionID: UUID,
+        speakerID: UInt64,
+        displayName: String
+    ) throws -> CoreVoiceProfileEnrollment {
+        throw CoreBridgeError.unavailable
+    }
+
+    func renameVoiceProfile(
+        profileID: UInt64,
+        displayName: String
+    ) throws {
+        throw CoreBridgeError.unavailable
+    }
+
+    func deleteVoiceProfile(profileID: UInt64) throws {
+        throw CoreBridgeError.unavailable
+    }
 }
 
 protocol CoreSessionProtocol: AnyObject, Sendable {

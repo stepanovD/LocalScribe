@@ -6,7 +6,7 @@ struct sqlite3;
 
 namespace localscribe {
 
-inline constexpr int kJournalSchemaVersion = 1;
+inline constexpr int kJournalSchemaVersion = 2;
 
 [[nodiscard]] Expected<void> applyMigrations(sqlite3 *database);
 

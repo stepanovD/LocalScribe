@@ -39,8 +39,9 @@ The repository contains one working macOS technical vertical:
 - local whisper.cpp v1.9.1 ASR with a user-selected `ggml-*.bin` model and a
   stateful 8–96 kHz streaming resampler;
 - replaceable ASR and diarization interfaces, with source-enforced `Me`
-  attribution for the microphone, a `Me` exclusion for system audio, and
-  robust prototype-based local clustering into anonymous remote speakers;
+  attribution for the microphone, a `Me` exclusion for system audio,
+  robust prototype-based local clustering, and explicitly saved voice profiles
+  that can carry a remote speaker's name into later calls;
 - a WAL-mode SQLite recovery journal and startup recovery that never restarts
   capture;
 - deterministic final-only Markdown rendering with compact dialogue rows and
@@ -105,6 +106,15 @@ Scripts/verify-mvp.sh
 
 The gate verifies the excluded scope, portable core contracts, Swift storage
 and recovery invariants, the linked macOS application bundle, and signatures.
+When full Xcode is selected, it also runs the Swift XCTest target. A
+Command-Line-Tools-only machine reports that XCTest was skipped; release or CI
+jobs can set `LOCALSCRIBE_REQUIRE_SWIFT_TESTS=1` to make its absence fail the
+gate. Run that target directly with:
+
+```sh
+Scripts/run-swift-tests.sh
+```
+
 If local test speech and a model are available, include real production ASR:
 
 ```sh
@@ -160,6 +170,51 @@ committed final segment at the instant of a crash cannot be reconstructed.
 Only a session whose terminal `complete` transition was already committed
 before the crash can be recovered as `complete`.
 
+## Persistent voice profiles
+
+Remote speakers begin as anonymous, per-call clusters such as `Speaker 1`.
+From the current or most recently completed call, the user can explicitly save
+one of those clusters as a named voice profile. LocalScribe stores only compact
+acoustic descriptors and their format/version metadata, never the source audio.
+Saving a profile relabels that speaker in the durable current/last call and
+publishes a new Markdown snapshot with the chosen name.
+
+To make post-call naming possible, the local recovery journal keeps these
+bounded descriptors with remote final segments before the user creates a
+profile. This evidence is not automatic enrollment and never receives a saved
+identity without the explicit naming action.
+
+At the start of a later call, compatible saved profiles seed local diarization.
+A remote turn receives a saved name only after a stricter acoustic match; a
+weak, ambiguous, short, corrupt, or format-incompatible observation remains
+`Speaker N`. Profile recognition failure does not stop transcription. The
+microphone source remains the configured local speaker and is never matched to
+a remote profile.
+
+Settings lists saved profiles and allows renaming or deleting them. These
+actions affect future recognition; LocalScribe does not silently rewrite every
+historical transcript. Profile creation is always a visible user action—calls
+do not automatically enroll every participant.
+
+Voice descriptors are sensitive biometric-derived data even though they cannot
+reconstruct the original recording. Descriptor bytes remain inside LocalScribe
+application storage and are excluded from Markdown, diagnostics, crash
+metadata, and network traffic; the chosen display name intentionally appears as
+the transcript's speaker label and participant. This version does not claim
+separate application-level encryption or forensic secure erasure from SSD
+snapshots, SQLite remnants, or backups; macOS account/device protection is
+still part of the privacy boundary.
+Deleting a profile makes it unavailable for future matching, but it does not
+erase descriptor evidence already retained with historical recovery-journal
+segments. Users with stronger at-rest or deletion requirements should treat
+that limitation explicitly.
+
+The current lightweight spectral descriptor is a convenience labeler, not
+biometric authentication or proof of identity. Different voices can be merged,
+and one voice can be split when devices, playback processing, noise, overlap,
+illness, or speaking style change. LocalScribe therefore prefers an anonymous
+label over a low-confidence name.
+
 ## Architecture package
 
 The architecture is fixed before implementation:
@@ -176,9 +231,11 @@ The architecture is fixed before implementation:
 
 - Start is manual; detection remains a proposal-only seam.
 - Remote-speaker labels come from lightweight, model-free acoustic clustering.
-  They are anonymous, session-local, limited to eight speakers, and can merge
-  similar voices or split very short/noisy turns. Compatible `*-tdrz` Whisper
-  models also contribute explicit speaker-turn hints.
+  Each call can still create up to eight new anonymous clusters. Explicitly
+  saved compatible profiles may supply names across calls, while unmatched or
+  ambiguous speech remains anonymous. Similar voices can merge and very short
+  or noisy turns can split; compatible `*-tdrz` Whisper models also contribute
+  explicit speaker-turn hints.
 - The model is selected locally rather than bundled or downloaded.
 - Stage 0 accepts a user-selected local whisper.cpp `ggml-*.bin` model without
   an artificial size cap. Each model/machine combination needs its own startup,

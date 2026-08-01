@@ -6,11 +6,44 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace localscribe {
 
 using StableId = std::array<std::uint8_t, 16>;
+
+/*
+ * Speaker ID 1 is permanently reserved for the microphone owner. Anonymous
+ * per-session remote speakers keep the high bit used by Stage 0. Persisted
+ * voice profiles use the next bit, leaving their SQLite identifier intact in
+ * the low 62 bits and making the two namespaces impossible to confuse.
+ */
+inline constexpr std::uint64_t kPersistentSpeakerFlag = 1ULL << 62u;
+inline constexpr std::uint64_t kAnonymousSpeakerFlag = 1ULL << 63u;
+inline constexpr std::uint64_t kSpeakerIdPayloadMask =
+    kPersistentSpeakerFlag - 1u;
+inline constexpr std::string_view kSpeakerFeatureModelId =
+    "spectral-envelope-v1";
+
+[[nodiscard]] inline bool
+isPersistentSpeakerId(std::uint64_t speakerId) noexcept
+{
+    return (speakerId & (kAnonymousSpeakerFlag | kPersistentSpeakerFlag))
+        == kPersistentSpeakerFlag;
+}
+
+[[nodiscard]] inline std::uint64_t
+persistentSpeakerId(std::uint64_t profileId) noexcept
+{
+    return kPersistentSpeakerFlag | (profileId & kSpeakerIdPayloadMask);
+}
+
+[[nodiscard]] inline std::uint64_t
+profileIdFromSpeakerId(std::uint64_t speakerId) noexcept
+{
+    return speakerId & kSpeakerIdPayloadMask;
+}
 
 struct BackendInfo {
     std::string id;
@@ -52,6 +85,7 @@ struct AsrHypothesis {
     bool final{};
     bool unintelligible{};
     bool speakerTurnAfter{};
+    std::string speakerEmbeddingModel;
     std::vector<float> speakerEmbedding;
 };
 
@@ -79,6 +113,27 @@ struct TranscriptSegment {
     std::uint32_t revision{};
     std::uint32_t flags{};
     std::uint64_t journalCheckpoint{};
+    std::string speakerEmbeddingModel;
+    std::vector<float> speakerEmbedding;
+};
+
+struct VoiceProfile {
+    std::uint64_t profileId{};
+    std::string displayName;
+    std::string embeddingModelId;
+    std::vector<float> centroid;
+    std::vector<std::vector<float>> prototypes;
+    std::uint64_t observationCount{};
+    std::int64_t createdAtUnixNs{};
+    std::int64_t updatedAtUnixNs{};
+};
+
+struct VoiceProfileEnrollment {
+    VoiceProfile profile;
+    std::uint64_t speakerId{};
+    std::uint32_t relabeledSegments{};
+    std::uint64_t journalCheckpoint{};
+    std::uint32_t highestSegmentRevision{};
 };
 
 struct SourceRecord {

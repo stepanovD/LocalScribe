@@ -136,9 +136,10 @@ The default diarization backend is source- and acoustics-aware:
 - microphone → configured local speaker (`Me` by default), enforced again
   before a final segment is committed;
 - system audio → never the local speaker;
-- system audio → up to eight anonymous, session-local remote speakers,
-  clustered from trimmed per-segment spectral voice descriptors using bounded
-  robust centroids and multiple recent prototypes;
+- system audio → persisted named profiles plus up to eight newly discovered
+  anonymous speakers per session, clustered from trimmed per-segment spectral
+  voice descriptors using bounded robust centroids and multiple recent
+  prototypes;
 - gray-zone acoustic changes remain provisional until a second consistent
   segment either expands the current voice profile or confirms a new speaker;
 - a single acoustic outlier cannot create a new anonymous speaker;
@@ -148,10 +149,26 @@ The default diarization backend is source- and acoustics-aware:
   hints.
 
 The legacy source-aware backend remains available for deterministic tests and
-compatibility. The interface supports revisions and confidence so a learned
-sherpa-onnx/ONNX speaker-embedding adapter can replace acoustic clustering
-without changing Swift or the journal schema. Calibrated production accuracy,
-overlap handling, and persistent voice profiles remain post-vertical work.
+compatibility. Persistent profiles occupy a speaker-ID namespace distinct from
+the local speaker and anonymous session clusters. A session loads compatible
+profile centroids/prototypes before diarization, uses a stricter profile-match
+gate than within-session clustering, and abstains to an anonymous `Speaker N`
+label when the result is weak, ambiguous, short, or model-incompatible. It
+never chooses a profile merely because it is the nearest available one.
+
+Enrollment is explicit: the user saves an anonymous cluster from the current or
+most recently completed call and supplies its display name. The transaction
+stores bounded acoustic descriptors and format/model metadata, relabels the
+selected call's durable segments, and advances the render checkpoint so Swift
+can republish that Markdown. Settings provides list, rename, and delete
+operations. These operations do not implicitly rewrite unrelated historical
+transcripts. No raw audio is retained for enrollment.
+
+The interface still supports revisions and confidence so a learned
+sherpa-onnx/ONNX speaker-embedding adapter can replace the lightweight spectral
+descriptor. Calibrated production accuracy and overlap handling remain
+post-vertical work; existing profiles are never compared across incompatible
+embedding model/version or vector formats.
 
 If a production ASR model is unavailable, preflight fails visibly. The app must
 not fabricate text or silently switch to a network service.
@@ -169,10 +186,13 @@ not the database.
 
 The journal uses WAL mode, foreign keys, explicit schema versioning, and
 transactions. A final segment is eligible for Markdown publication only after
-its current revision is committed. The journal stores no raw audio by default;
-therefore recovery guarantees all committed final segments but may lose the
-unfinalized inference tail at a crash. This limitation is surfaced as
-`interrupted`.
+its current revision is committed. The same versioned local store owns voice
+profile metadata and bounded descriptors so they survive process and session
+restarts independently of capture recovery. Enrollment and relabeling are one
+transaction; a crash cannot expose a profile whose selected call was only
+partly relabeled. The journal stores no raw audio by default; therefore recovery
+guarantees all committed final segments but may lose the unfinalized inference
+tail at a crash. This limitation is surfaced as `interrupted`.
 
 There is one canonical internal `phase` in core and SQLite. Markdown exposes
 the smaller Product Reference `status` vocabulary:
@@ -253,6 +273,20 @@ prompts, or hidden metadata.
 - Logs contain IDs, state names, counts, durations, and error codes only.
 - Audio samples, transcript text, participant names, file contents, embeddings,
   and full user paths are prohibited in logs and crash metadata.
+- Voice-profile enrollment is a visible user action. Calls never silently
+  enroll every participant, and a missing/corrupt/incompatible profile falls
+  back to anonymous diarization without blocking transcription.
+- Bounded descriptors for remote final segments are retained in the local
+  recovery journal before enrollment so the current/last call can be named
+  afterward. Deleting a profile stops future matching but does not purge that
+  historical segment evidence.
+- Stored descriptors are sensitive biometric-derived data. They are never raw
+  audio and are never rendered or exported, but the current implementation does
+  not claim separate application-level encryption or forensic secure erasure
+  from SQLite remnants, SSD snapshots, or backups. macOS account/device storage
+  protection remains part of the privacy boundary.
+- Profile matching is a convenience label, not biometric authentication or
+  proof of identity. The UI and documentation must not present it as such.
 - Recording state is always visibly distinguishable by icon and text, not color
   alone.
 - Stale queued core phases are compared with the authoritative current state,
@@ -287,6 +321,8 @@ prompts, or hidden metadata.
 - Capture code and the UI can evolve without changing the journal or inference
   contracts.
 - A backend can be replaced without exposing its types to Swift.
+- Explicitly named remote speakers can be recognized across calls while weak or
+  incompatible evidence remains anonymous.
 - Recovery and Markdown equality are testable without audio hardware or
   Obsidian.
 - No second platform is needed to prove portability.
@@ -301,6 +337,8 @@ prompts, or hidden metadata.
   encrypted audio spool policy is separately accepted.
 - Runtime capture and signing cannot be fully verified without full Xcode and
   user-granted TCC permissions.
+- Persistent acoustic descriptors add sensitive local state, format migration,
+  false-match, poisoning, deletion, and backup-retention risks.
 
 ## Rejected alternatives
 
@@ -325,7 +363,8 @@ These are not silently chosen by the technical vertical:
 
 - bundled model and model-download UX;
 - learned production diarization backend and calibrated thresholds;
-- encrypted voice-profile lifecycle;
+- per-profile application-level encryption, key rotation, and cryptographic
+  deletion guarantees;
 - encrypted raw-audio spool and retention;
 - call-detection signal scoring;
 - import and JSON/SRT/VTT export;

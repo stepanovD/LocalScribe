@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numbers>
 #include <numeric>
 #include <vector>
@@ -35,6 +36,21 @@ void appendSamples(
 std::vector<float> speakerEmbeddingAtAngle(float radians)
 {
     return {std::cos(radians), std::sin(radians)};
+}
+
+VoiceProfile voiceProfile(
+    std::uint64_t profileId,
+    std::string name,
+    float angle)
+{
+    VoiceProfile profile;
+    profile.profileId = profileId;
+    profile.displayName = std::move(name);
+    profile.embeddingModelId = std::string{kSpeakerFeatureModelId};
+    profile.centroid = speakerEmbeddingAtAngle(angle);
+    profile.prototypes = {profile.centroid};
+    profile.observationCount = 4;
+    return profile;
 }
 
 } // namespace
@@ -508,6 +524,592 @@ LS_TEST(acoustic_diarization_honors_tinydiarize_turns_without_embedding)
         first.value()[0].speakerId != second.value()[0].speakerId);
 }
 
+LS_TEST(acoustic_diarization_recognizes_a_persisted_voice_profile)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis hypothesis;
+    hypothesis.stableId[15] = 1;
+    hypothesis.sourceId = 22;
+    hypothesis.startTimeNs = 1'000'000'000;
+    hypothesis.endTimeNs = 2'000'000'000;
+    hypothesis.final = true;
+    hypothesis.revision = 1;
+    hypothesis.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    hypothesis.speakerEmbedding = speakerEmbeddingAtAngle(0.05F);
+
+    const auto turn = backend.value()->assign(system, {&hypothesis, 1});
+    LS_CHECK(turn);
+    LS_CHECK_EQ(turn.value()[0].speakerId, persistentSpeakerId(42));
+    LS_CHECK_EQ(turn.value()[0].speakerLabel, std::string{"Alice"});
+}
+
+LS_TEST(acoustic_diarization_abstains_when_profiles_are_ambiguous)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles = {
+        voiceProfile(7, "Alice", -0.10F),
+        voiceProfile(8, "Bob", 0.10F)};
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis hypothesis;
+    hypothesis.stableId[15] = 1;
+    hypothesis.sourceId = 22;
+    hypothesis.final = true;
+    hypothesis.revision = 1;
+    hypothesis.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    hypothesis.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+
+    const auto turn = backend.value()->assign(system, {&hypothesis, 1});
+    LS_CHECK(turn);
+    LS_CHECK(!isPersistentSpeakerId(turn.value()[0].speakerId));
+    LS_CHECK_EQ(turn.value()[0].speakerLabel, std::string{"Speaker 1"});
+}
+
+LS_TEST(acoustic_diarization_ignores_incompatible_profile_embeddings)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis hypothesis;
+    hypothesis.stableId[15] = 1;
+    hypothesis.sourceId = 22;
+    hypothesis.final = true;
+    hypothesis.revision = 1;
+    hypothesis.speakerEmbeddingModel = "different-extractor-v1";
+    hypothesis.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+
+    const auto turn = backend.value()->assign(system, {&hypothesis, 1});
+    LS_CHECK(turn);
+    LS_CHECK(!isPersistentSpeakerId(turn.value()[0].speakerId));
+    LS_CHECK_EQ(turn.value()[0].speakerLabel, std::string{"Speaker 1"});
+}
+
+LS_TEST(acoustic_diarization_does_not_adapt_persisted_profiles_implicitly)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    const auto hypothesis = [](std::uint8_t id,
+                               float angle,
+                               std::int64_t startTimeNs) {
+        AsrHypothesis value;
+        value.stableId[15] = id;
+        value.sourceId = 22;
+        value.startTimeNs = startTimeNs;
+        value.endTimeNs = startTimeNs + 500'000'000;
+        value.final = true;
+        value.revision = 1;
+        value.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+        value.speakerEmbedding = speakerEmbeddingAtAngle(angle);
+        return value;
+    };
+    const auto nearAlice = hypothesis(1, 0.30F, 1'000'000'000);
+    const auto driftingAway = hypothesis(2, 0.58F, 3'000'000'000);
+
+    const auto first = backend.value()->assign(system, {&nearAlice, 1});
+    const auto second = backend.value()->assign(system, {&driftingAway, 1});
+    LS_CHECK(first);
+    LS_CHECK(second);
+    LS_CHECK_EQ(first.value()[0].speakerId, persistentSpeakerId(42));
+    LS_CHECK(!isPersistentSpeakerId(second.value()[0].speakerId));
+}
+
+LS_TEST(acoustic_diarization_prefers_a_stronger_session_cluster_to_a_profile)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    const auto hypothesis = [](std::uint8_t id,
+                               float angle,
+                               std::int64_t startTimeNs) {
+        AsrHypothesis value;
+        value.stableId[15] = id;
+        value.sourceId = 22;
+        value.startTimeNs = startTimeNs;
+        value.endTimeNs = startTimeNs + 500'000'000;
+        value.final = true;
+        value.revision = 1;
+        value.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+        value.speakerEmbedding = speakerEmbeddingAtAngle(angle);
+        return value;
+    };
+    const auto unknown = hypothesis(1, 0.40F, 1'000'000'000);
+    const auto sameUnknown = hypothesis(2, 0.30F, 3'000'000'000);
+
+    const auto first = backend.value()->assign(system, {&unknown, 1});
+    const auto second = backend.value()->assign(system, {&sameUnknown, 1});
+    LS_CHECK(first);
+    LS_CHECK(second);
+    LS_CHECK(!isPersistentSpeakerId(first.value()[0].speakerId));
+    LS_CHECK_EQ(second.value()[0].speakerId, first.value()[0].speakerId);
+
+    auto revisedUnknown = sameUnknown;
+    revisedUnknown.revision = 2;
+    revisedUnknown.speakerEmbedding = speakerEmbeddingAtAngle(0.20F);
+    const auto revised =
+        backend.value()->assign(system, {&revisedUnknown, 1});
+    LS_CHECK(revised);
+    LS_CHECK_EQ(revised.value()[0].speakerId, first.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_requires_voice_evidence_for_a_profile_label)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    const auto voiced = [](std::uint8_t id,
+                           float angle,
+                           std::int64_t startTimeNs) {
+        AsrHypothesis value;
+        value.stableId[15] = id;
+        value.sourceId = 22;
+        value.startTimeNs = startTimeNs;
+        value.endTimeNs = startTimeNs + 500'000'000;
+        value.final = true;
+        value.revision = 1;
+        value.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+        value.speakerEmbedding = speakerEmbeddingAtAngle(angle);
+        return value;
+    };
+    const auto unknown = voiced(1, 0.80F, 1'000'000'000);
+    const auto alice = voiced(2, 0.0F, 3'000'000'000);
+    AsrHypothesis noVoice;
+    noVoice.stableId[15] = 3;
+    noVoice.sourceId = 22;
+    noVoice.startTimeNs = 10'000'000'000;
+    noVoice.endTimeNs = 10'500'000'000;
+    noVoice.final = true;
+    noVoice.revision = 1;
+    noVoice.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+
+    const auto first = backend.value()->assign(system, {&unknown, 1});
+    const auto second = backend.value()->assign(system, {&alice, 1});
+    const auto third = backend.value()->assign(system, {&noVoice, 1});
+    LS_CHECK(first);
+    LS_CHECK(second);
+    LS_CHECK(third);
+    LS_CHECK_EQ(second.value()[0].speakerId, persistentSpeakerId(42));
+    LS_CHECK(!isPersistentSpeakerId(third.value()[0].speakerId));
+}
+
+LS_TEST(acoustic_diarization_reconsiders_profiles_on_better_revisions)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis partial;
+    partial.stableId[15] = 1;
+    partial.sourceId = 22;
+    partial.startTimeNs = 1'000'000'000;
+    partial.endTimeNs = 1'500'000'000;
+    partial.revision = 1;
+    partial.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    AsrHypothesis final = partial;
+    final.final = true;
+    final.revision = 2;
+    final.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+
+    const auto provisional = backend.value()->assign(system, {&partial, 1});
+    const auto revised = backend.value()->assign(system, {&final, 1});
+    LS_CHECK(provisional);
+    LS_CHECK(revised);
+    LS_CHECK(!isPersistentSpeakerId(provisional.value()[0].speakerId));
+    LS_CHECK_EQ(revised.value()[0].speakerId, persistentSpeakerId(42));
+
+    AsrHypothesis earlyMatch = final;
+    earlyMatch.stableId[15] = 2;
+    earlyMatch.startTimeNs = 3'000'000'000;
+    earlyMatch.endTimeNs = 3'500'000'000;
+    earlyMatch.final = false;
+    earlyMatch.revision = 1;
+    AsrHypothesis corrected = earlyMatch;
+    corrected.final = true;
+    corrected.revision = 2;
+    corrected.speakerEmbedding = speakerEmbeddingAtAngle(1.0F);
+
+    const auto matched = backend.value()->assign(system, {&earlyMatch, 1});
+    const auto correctedTurn =
+        backend.value()->assign(system, {&corrected, 1});
+    LS_CHECK(matched);
+    LS_CHECK(correctedTurn);
+    LS_CHECK_EQ(matched.value()[0].speakerId, persistentSpeakerId(42));
+    LS_CHECK(!isPersistentSpeakerId(correctedTurn.value()[0].speakerId));
+
+    auto duplicate = corrected;
+    duplicate.speakerTurnAfter = true;
+    const auto duplicateTurn =
+        backend.value()->assign(system, {&duplicate, 1});
+    LS_CHECK(duplicateTurn);
+    LS_CHECK_EQ(
+        duplicateTurn.value()[0].speakerId,
+        correctedTurn.value()[0].speakerId);
+
+    auto stale = earlyMatch;
+    stale.final = true;
+    stale.speakerTurnAfter = true;
+    const auto staleTurn = backend.value()->assign(system, {&stale, 1});
+    LS_CHECK(staleTurn);
+    LS_CHECK_EQ(
+        staleTurn.value()[0].speakerId,
+        correctedTurn.value()[0].speakerId);
+
+    AsrHypothesis following = corrected;
+    following.stableId[15] = 3;
+    following.revision = 1;
+    following.startTimeNs = 5'000'000'000;
+    following.endTimeNs = 5'500'000'000;
+    const auto followingTurn =
+        backend.value()->assign(system, {&following, 1});
+    LS_CHECK(followingTurn);
+    LS_CHECK_EQ(
+        followingTurn.value()[0].speakerId,
+        correctedTurn.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_keeps_embedding_models_isolated)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    LS_CHECK(backend.value()->prepare(
+        DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    const auto hypothesis = [](std::uint8_t id,
+                               std::string model,
+                               float angle,
+                               std::int64_t startTimeNs) {
+        AsrHypothesis value;
+        value.stableId[15] = id;
+        value.sourceId = 22;
+        value.startTimeNs = startTimeNs;
+        value.endTimeNs = startTimeNs + 500'000'000;
+        value.final = true;
+        value.revision = 1;
+        value.speakerEmbeddingModel = std::move(model);
+        value.speakerEmbedding = speakerEmbeddingAtAngle(angle);
+        return value;
+    };
+    const auto firstModel =
+        hypothesis(1, "model-a", 0.0F, 1'000'000'000);
+    const auto secondModel =
+        hypothesis(2, "model-b", 0.0F, 3'000'000'000);
+    const auto firstModelAgain =
+        hypothesis(3, "model-a", 0.01F, 5'000'000'000);
+
+    const auto first = backend.value()->assign(system, {&firstModel, 1});
+    const auto second = backend.value()->assign(system, {&secondModel, 1});
+    const auto third =
+        backend.value()->assign(system, {&firstModelAgain, 1});
+    LS_CHECK(first);
+    LS_CHECK(second);
+    LS_CHECK(third);
+    LS_CHECK(first.value()[0].speakerId != second.value()[0].speakerId);
+    LS_CHECK_EQ(third.value()[0].speakerId, first.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_treats_non_finite_embeddings_as_missing)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis invalid;
+    invalid.stableId[15] = 1;
+    invalid.sourceId = 22;
+    invalid.startTimeNs = 1'000'000'000;
+    invalid.endTimeNs = 1'500'000'000;
+    invalid.final = true;
+    invalid.revision = 1;
+    invalid.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    invalid.speakerEmbedding = {
+        std::numeric_limits<float>::quiet_NaN(),
+        0.0F};
+
+    const auto turn = backend.value()->assign(system, {&invalid, 1});
+    LS_CHECK(turn);
+    LS_CHECK(!isPersistentSpeakerId(turn.value()[0].speakerId));
+    LS_CHECK(std::isfinite(turn.value()[0].confidence));
+}
+
+LS_TEST(acoustic_diarization_does_not_let_profiles_bypass_novel_confirmation)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    const auto hypothesis = [](std::uint8_t id,
+                               float angle,
+                               std::int64_t startTimeNs) {
+        AsrHypothesis value;
+        value.stableId[15] = id;
+        value.sourceId = 22;
+        value.startTimeNs = startTimeNs;
+        value.endTimeNs = startTimeNs + 500'000'000;
+        value.final = true;
+        value.revision = 1;
+        value.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+        value.speakerEmbedding = speakerEmbeddingAtAngle(angle);
+        return value;
+    };
+    const auto seed = hypothesis(1, 1.20F, 1'000'000'000);
+    const auto novelFirst = hypothesis(2, 0.57F, 4'000'000'000);
+    const auto novelSecond = hypothesis(3, 0.18F, 5'000'000'000);
+
+    const auto seedTurn = backend.value()->assign(system, {&seed, 1});
+    const auto firstTurn =
+        backend.value()->assign(system, {&novelFirst, 1});
+    const auto secondTurn =
+        backend.value()->assign(system, {&novelSecond, 1});
+    LS_CHECK(seedTurn);
+    LS_CHECK(firstTurn);
+    LS_CHECK(secondTurn);
+    LS_CHECK_EQ(firstTurn.value()[0].speakerId, seedTurn.value()[0].speakerId);
+    LS_CHECK(!isPersistentSpeakerId(secondTurn.value()[0].speakerId));
+    LS_CHECK(secondTurn.value()[0].speakerId != seedTurn.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_discards_pending_voice_at_an_explicit_turn)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    const auto hypothesis = [](std::uint8_t id,
+                               float angle,
+                               std::int64_t startTimeNs) {
+        AsrHypothesis value;
+        value.stableId[15] = id;
+        value.sourceId = 22;
+        value.startTimeNs = startTimeNs;
+        value.endTimeNs = startTimeNs + 500'000'000;
+        value.final = true;
+        value.revision = 1;
+        value.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+        value.speakerEmbedding = speakerEmbeddingAtAngle(angle);
+        return value;
+    };
+    const auto seed = hypothesis(1, 1.20F, 1'000'000'000);
+    auto beforeTurn = hypothesis(2, 0.60F, 4'000'000'000);
+    beforeTurn.speakerTurnAfter = true;
+    const auto alice = hypothesis(3, 0.317F, 5'000'000'000);
+
+    LS_CHECK(backend.value()->assign(system, {&seed, 1}));
+    LS_CHECK(backend.value()->assign(system, {&beforeTurn, 1}));
+    const auto afterTurn = backend.value()->assign(system, {&alice, 1});
+    LS_CHECK(afterTurn);
+    LS_CHECK_EQ(afterTurn.value()[0].speakerId, persistentSpeakerId(42));
+}
+
+LS_TEST(acoustic_diarization_tracks_revision_cluster_evidence_ownership)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis independent;
+    independent.stableId[15] = 1;
+    independent.sourceId = 22;
+    independent.startTimeNs = 1'000'000'000;
+    independent.endTimeNs = 1'500'000'000;
+    independent.final = true;
+    independent.revision = 1;
+    independent.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    independent.speakerEmbedding = speakerEmbeddingAtAngle(0.40F);
+    AsrHypothesis partial;
+    partial.stableId[15] = 2;
+    partial.sourceId = 22;
+    partial.startTimeNs = 2'000'000'000;
+    partial.endTimeNs = 2'500'000'000;
+    partial.revision = 1;
+    partial.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    AsrHypothesis final = partial;
+    final.final = true;
+    final.revision = 2;
+    final.speakerEmbedding = speakerEmbeddingAtAngle(0.30F);
+
+    const auto independentTurn =
+        backend.value()->assign(system, {&independent, 1});
+    const auto partialTurn = backend.value()->assign(system, {&partial, 1});
+    const auto finalTurn = backend.value()->assign(system, {&final, 1});
+    LS_CHECK(independentTurn);
+    LS_CHECK(partialTurn);
+    LS_CHECK(finalTurn);
+    LS_CHECK_EQ(
+        partialTurn.value()[0].speakerId,
+        independentTurn.value()[0].speakerId);
+    LS_CHECK_EQ(
+        finalTurn.value()[0].speakerId,
+        independentTurn.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_retires_unreferenced_revision_clusters)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    DiarizationConfiguration configuration{11, 22, "Me", "Speaker 1"};
+    configuration.voiceProfiles.push_back(
+        voiceProfile(42, "Alice", 0.0F));
+    LS_CHECK(backend.value()->prepare(configuration));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis partial;
+    partial.stableId[15] = 1;
+    partial.sourceId = 22;
+    partial.startTimeNs = 1'000'000'000;
+    partial.endTimeNs = 1'500'000'000;
+    partial.revision = 1;
+    partial.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    partial.speakerEmbedding = speakerEmbeddingAtAngle(0.35F);
+    AsrHypothesis final = partial;
+    final.final = true;
+    final.revision = 2;
+    final.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+    AsrHypothesis noEvidence;
+    noEvidence.stableId[15] = 2;
+    noEvidence.sourceId = 22;
+    noEvidence.startTimeNs = 1'600'000'000;
+    noEvidence.endTimeNs = 1'900'000'000;
+    noEvidence.revision = 1;
+    noEvidence.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    AsrHypothesis alice = final;
+    alice.stableId[15] = 3;
+    alice.revision = 1;
+    alice.startTimeNs = 3'000'000'000;
+    alice.endTimeNs = 3'500'000'000;
+    alice.speakerEmbedding = speakerEmbeddingAtAngle(0.20F);
+
+    const auto provisional = backend.value()->assign(system, {&partial, 1});
+    const auto inherited =
+        backend.value()->assign(system, {&noEvidence, 1});
+    const auto revised = backend.value()->assign(system, {&final, 1});
+    const auto following = backend.value()->assign(system, {&alice, 1});
+    LS_CHECK(provisional);
+    LS_CHECK(inherited);
+    LS_CHECK(revised);
+    LS_CHECK(following);
+    LS_CHECK(!isPersistentSpeakerId(provisional.value()[0].speakerId));
+    LS_CHECK_EQ(
+        inherited.value()[0].speakerId,
+        provisional.value()[0].speakerId);
+    LS_CHECK_EQ(revised.value()[0].speakerId, persistentSpeakerId(42));
+    LS_CHECK_EQ(following.value()[0].speakerId, persistentSpeakerId(42));
+}
+
+LS_TEST(acoustic_diarization_reuses_empty_revision_placeholders)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    LS_CHECK(backend.value()->prepare(
+        DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
+
+    AudioWindow system;
+    system.sourceId = 22;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    AsrHypothesis partial;
+    partial.stableId[15] = 1;
+    partial.sourceId = 22;
+    partial.startTimeNs = 1'000'000'000;
+    partial.endTimeNs = 1'500'000'000;
+    partial.revision = 1;
+    partial.speakerEmbeddingModel = "model-a";
+    AsrHypothesis final = partial;
+    final.final = true;
+    final.revision = 2;
+    final.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+    AsrHypothesis next = final;
+    next.stableId[15] = 2;
+    next.revision = 1;
+    next.startTimeNs = 3'000'000'000;
+    next.endTimeNs = 3'500'000'000;
+    next.speakerEmbedding = speakerEmbeddingAtAngle(0.01F);
+
+    const auto provisional = backend.value()->assign(system, {&partial, 1});
+    const auto revised = backend.value()->assign(system, {&final, 1});
+    const auto following = backend.value()->assign(system, {&next, 1});
+    LS_CHECK(provisional);
+    LS_CHECK(revised);
+    LS_CHECK(following);
+    LS_CHECK_EQ(revised.value()[0].speakerId, provisional.value()[0].speakerId);
+    LS_CHECK_EQ(following.value()[0].speakerId, provisional.value()[0].speakerId);
+}
+
 LS_TEST(speaker_feature_extractor_distinguishes_spectral_envelopes)
 {
     constexpr std::uint32_t sampleRate = 16'000;
@@ -540,6 +1142,59 @@ LS_TEST(speaker_feature_extractor_distinguishes_spectral_envelopes)
         highFeatures.begin(),
         0.0F);
     LS_CHECK(similarity < 0.82F);
+}
+
+LS_TEST(speaker_feature_extractor_is_stable_across_matching_recordings)
+{
+    constexpr std::uint32_t sampleRate = 16'000;
+    constexpr std::size_t sampleCount = sampleRate;
+    std::vector<float> first(sampleCount);
+    std::vector<float> second(sampleCount);
+    std::vector<float> different(sampleCount);
+    for (std::size_t index = 0; index < sampleCount; ++index) {
+        const float time =
+            static_cast<float>(index) / static_cast<float>(sampleRate);
+        first[index] =
+            0.30F * std::sin(2.0F * std::numbers::pi_v<float> * 140.0F * time)
+            + 0.20F
+                * std::sin(
+                    2.0F * std::numbers::pi_v<float> * 700.0F * time);
+        second[index] =
+            0.18F
+                * std::sin(
+                    2.0F * std::numbers::pi_v<float> * 140.0F * time
+                    + 0.7F)
+            + 0.12F
+                * std::sin(
+                    2.0F * std::numbers::pi_v<float> * 700.0F * time
+                    + 1.1F);
+        different[index] =
+            0.30F * std::sin(2.0F * std::numbers::pi_v<float> * 260.0F * time)
+            + 0.20F
+                * std::sin(
+                    2.0F * std::numbers::pi_v<float> * 2'100.0F * time);
+    }
+    const auto firstFeatures =
+        SpeakerFeatureExtractor::extract(first, sampleRate);
+    const auto secondFeatures =
+        SpeakerFeatureExtractor::extract(second, sampleRate);
+    const auto differentFeatures =
+        SpeakerFeatureExtractor::extract(different, sampleRate);
+    LS_CHECK(!firstFeatures.empty());
+    LS_CHECK_EQ(firstFeatures.size(), secondFeatures.size());
+    LS_CHECK_EQ(firstFeatures.size(), differentFeatures.size());
+    const float sameSimilarity = std::inner_product(
+        firstFeatures.begin(),
+        firstFeatures.end(),
+        secondFeatures.begin(),
+        0.0F);
+    const float differentSimilarity = std::inner_product(
+        firstFeatures.begin(),
+        firstFeatures.end(),
+        differentFeatures.begin(),
+        0.0F);
+    LS_CHECK(sameSimilarity >= 0.94F);
+    LS_CHECK(differentSimilarity < 0.94F);
 }
 
 LS_TEST(speaker_feature_extractor_ignores_short_unstable_segments)

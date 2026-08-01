@@ -12,12 +12,16 @@ final class AppModel: ObservableObject {
     @Published private(set) var hasVaultSelection = false
     @Published private(set) var hasModelSelection = false
     @Published private(set) var setupFailure: SessionFailureCode?
+    @Published private(set) var voiceProfiles: [CoreVoiceProfile] = []
+    @Published private(set) var voiceProfileFailure: String?
+    @Published private(set) var isVoiceProfileOperationInProgress = false
 
     private let directoryStore: SecurityScopedDirectoryStore
     private let modelStore: SecurityScopedModelStore
     private let controller: SessionController?
     private let consentIssuer = VisibleConsentIssuer()
     private var updatesTask: Task<Void, Never>?
+    private var voiceProfileRefreshGeneration = LatestRequestGeneration()
 
     init() {
         let directoryStore = SecurityScopedDirectoryStore()
@@ -257,6 +261,105 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func saveVoiceProfile(
+        sessionID: UUID,
+        speakerID: UInt64,
+        displayName: String
+    ) {
+        guard let controller else {
+            voiceProfileFailure = "Voice profiles are unavailable."
+            return
+        }
+        guard !isVoiceProfileOperationInProgress else {
+            return
+        }
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            voiceProfileFailure = "Enter a name for this speaker."
+            return
+        }
+        _ = voiceProfileRefreshGeneration.advance()
+        isVoiceProfileOperationInProgress = true
+        voiceProfileFailure = nil
+        Task {
+            defer { isVoiceProfileOperationInProgress = false }
+            do {
+                try await controller.enrollVoiceProfile(
+                    sessionID: sessionID,
+                    speakerID: speakerID,
+                    displayName: name
+                )
+                await refreshVoiceProfiles()
+            } catch {
+                _ = voiceProfileRefreshGeneration.advance()
+                voiceProfileFailure =
+                    "The voice profile could not be saved. Try again."
+            }
+        }
+    }
+
+    func renameVoiceProfile(_ profile: CoreVoiceProfile, to displayName: String) {
+        guard let controller else {
+            voiceProfileFailure = "Voice profiles are unavailable."
+            return
+        }
+        guard !isVoiceProfileOperationInProgress else {
+            return
+        }
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            voiceProfileFailure = "A voice profile name cannot be empty."
+            return
+        }
+        _ = voiceProfileRefreshGeneration.advance()
+        isVoiceProfileOperationInProgress = true
+        voiceProfileFailure = nil
+        Task {
+            defer { isVoiceProfileOperationInProgress = false }
+            do {
+                try await controller.renameVoiceProfile(
+                    profileID: profile.profileID,
+                    displayName: name
+                )
+                await refreshVoiceProfiles()
+            } catch {
+                _ = voiceProfileRefreshGeneration.advance()
+                voiceProfileFailure =
+                    "The voice profile could not be renamed. Try again."
+            }
+        }
+    }
+
+    func deleteVoiceProfile(_ profile: CoreVoiceProfile) {
+        guard let controller else {
+            voiceProfileFailure = "Voice profiles are unavailable."
+            return
+        }
+        guard !isVoiceProfileOperationInProgress else {
+            return
+        }
+        _ = voiceProfileRefreshGeneration.advance()
+        isVoiceProfileOperationInProgress = true
+        voiceProfileFailure = nil
+        Task {
+            defer { isVoiceProfileOperationInProgress = false }
+            do {
+                try await controller.deleteVoiceProfile(
+                    profileID: profile.profileID
+                )
+                await refreshVoiceProfiles()
+            } catch {
+                _ = voiceProfileRefreshGeneration.advance()
+                voiceProfileFailure =
+                    "The voice profile could not be deleted. Try again."
+            }
+        }
+    }
+
+    func dismissVoiceProfileFailure() {
+        voiceProfileFailure = nil
+    }
+
     func quit() {
         NSApplication.shared.terminate(nil)
     }
@@ -270,6 +373,30 @@ final class AppModel: ObservableObject {
         hasModelSelection = await modelStore.hasSelection()
         if let controller {
             permissions = await controller.currentPermissionSnapshot()
+        }
+        await refreshVoiceProfiles()
+    }
+
+    func refreshVoiceProfiles() async {
+        let generation = voiceProfileRefreshGeneration.advance()
+        guard let controller else {
+            if voiceProfileRefreshGeneration.isCurrent(generation) {
+                voiceProfiles = []
+            }
+            return
+        }
+        do {
+            let profiles = try await controller.voiceProfiles()
+            guard voiceProfileRefreshGeneration.isCurrent(generation) else {
+                return
+            }
+            voiceProfiles = profiles
+            voiceProfileFailure = nil
+        } catch {
+            guard voiceProfileRefreshGeneration.isCurrent(generation) else {
+                return
+            }
+            voiceProfileFailure = "Saved voice profiles could not be loaded."
         }
     }
 

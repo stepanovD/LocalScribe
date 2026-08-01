@@ -181,10 +181,87 @@ PRAGMA user_version = 1;
 COMMIT;
 )SQL";
 
-    auto migration = execute(database, kMigrationV1);
-    if (!migration) {
-        (void)execute(database, "ROLLBACK");
-        return migration;
+    static constexpr const char *kMigrationV2 = R"SQL(
+BEGIN IMMEDIATE;
+
+ALTER TABLE segments
+    ADD COLUMN speaker_embedding_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE segments
+    ADD COLUMN speaker_embedding_dimension INTEGER NOT NULL DEFAULT 0
+        CHECK (speaker_embedding_dimension >= 0);
+ALTER TABLE segments
+    ADD COLUMN speaker_embedding BLOB NOT NULL DEFAULT X''
+        CHECK (length(speaker_embedding) = speaker_embedding_dimension * 4);
+
+CREATE INDEX segments_session_speaker
+    ON segments(session_id, speaker_id, stable_id, revision);
+
+CREATE TABLE voice_profiles (
+    profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    embedding_model_id TEXT NOT NULL,
+    embedding_dimension INTEGER NOT NULL CHECK (embedding_dimension > 0),
+    centroid BLOB NOT NULL CHECK (
+        length(centroid) = embedding_dimension * 4
+    ),
+    observation_count INTEGER NOT NULL CHECK (observation_count > 0),
+    created_at_unix_ns INTEGER NOT NULL CHECK (created_at_unix_ns >= 0),
+    updated_at_unix_ns INTEGER NOT NULL CHECK (updated_at_unix_ns >= created_at_unix_ns),
+    CHECK (profile_id > 0 AND profile_id <= 4611686018427387903)
+);
+
+CREATE TABLE voice_profile_prototypes (
+    profile_id INTEGER NOT NULL
+        REFERENCES voice_profiles(profile_id) ON DELETE CASCADE,
+    prototype_index INTEGER NOT NULL CHECK (prototype_index >= 0),
+    embedding_dimension INTEGER NOT NULL CHECK (embedding_dimension > 0),
+    embedding BLOB NOT NULL CHECK (
+        length(embedding) = embedding_dimension * 4
+    ),
+    PRIMARY KEY (profile_id, prototype_index)
+);
+
+CREATE TABLE voice_profile_observations (
+    profile_id INTEGER NOT NULL
+        REFERENCES voice_profiles(profile_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL
+        REFERENCES sessions(session_id) ON DELETE CASCADE,
+    stable_id BLOB NOT NULL CHECK (length(stable_id) = 16),
+    PRIMARY KEY (profile_id, session_id, stable_id)
+);
+
+CREATE TABLE session_voice_profile_enrollments (
+    session_id TEXT NOT NULL
+        REFERENCES sessions(session_id) ON DELETE CASCADE,
+    original_speaker_id INTEGER NOT NULL,
+    profile_id INTEGER NOT NULL CHECK (
+        profile_id > 0 AND profile_id <= 4611686018427387903
+    ),
+    display_name TEXT NOT NULL CHECK (
+        length(CAST(display_name AS BLOB)) BETWEEN 1 AND 256
+    ),
+    PRIMARY KEY (session_id, original_speaker_id)
+);
+
+PRAGMA user_version = 2;
+COMMIT;
+)SQL";
+
+    int currentVersion = version.value();
+    if (currentVersion < 1) {
+        auto migration = execute(database, kMigrationV1);
+        if (!migration) {
+            (void)execute(database, "ROLLBACK");
+            return migration;
+        }
+        currentVersion = 1;
+    }
+    if (currentVersion < 2) {
+        auto migration = execute(database, kMigrationV2);
+        if (!migration) {
+            (void)execute(database, "ROLLBACK");
+            return migration;
+        }
     }
     return success();
 }

@@ -1432,6 +1432,9 @@ private:
                            ? "Remote Speaker 1"
                            : "Speaker 1")
                     : turn->speakerLabel;
+                segment.speakerEmbeddingModel =
+                    hypothesis.speakerEmbeddingModel;
+                segment.speakerEmbedding = hypothesis.speakerEmbedding;
             } else {
                 latchFatal(
                     Error{
@@ -2069,6 +2072,10 @@ struct ls_recovery_list {
     std::vector<std::string> sessionIds;
 };
 
+struct ls_voice_profile_list {
+    std::vector<localscribe::VoiceProfile> profiles;
+};
+
 using namespace localscribe;
 
 extern "C" {
@@ -2227,6 +2234,15 @@ ls_status_code_t ls_session_create_after_consent_v1(
             return report(asrPrepared.error(), out_error);
         }
 
+        auto journal = core->runtime->journalFor(journalPath.value());
+        if (!journal) {
+            return report(journal.error(), out_error);
+        }
+        auto voiceProfiles = journal.value()->listVoiceProfiles();
+        if (!voiceProfiles) {
+            return report(voiceProfiles.error(), out_error);
+        }
+
         auto diarization =
             createDiarizationBackend(diarizationId.value());
         if (!diarization) {
@@ -2237,16 +2253,13 @@ ls_status_code_t ls_session_create_after_consent_v1(
         diarizationConfiguration.systemAudioSourceId = systemId;
         diarizationConfiguration.localSpeakerName =
             localSpeaker.value().empty() ? "Me" : localSpeaker.value();
+        diarizationConfiguration.voiceProfiles = voiceProfiles.takeValue();
         auto diarizationPrepared =
             diarization.value()->prepare(diarizationConfiguration);
         if (!diarizationPrepared) {
             return report(diarizationPrepared.error(), out_error);
         }
 
-        auto journal = core->runtime->journalFor(journalPath.value());
-        if (!journal) {
-            return report(journal.error(), out_error);
-        }
         SessionRecord record;
         record.sessionId = sessionId.takeValue();
         record.phase = LS_PHASE_PREPARING;
@@ -2818,6 +2831,190 @@ void ls_recovery_list_destroy(ls_recovery_list_t *list)
     try {
         delete list;
     } catch (...) {
+    }
+}
+
+ls_status_code_t ls_core_list_voice_profiles_v1(
+    ls_core_t *core,
+    ls_voice_profile_list_t **out_list,
+    ls_error_v1 *out_error)
+{
+    if (out_list != nullptr) {
+        *out_list = nullptr;
+    }
+    clearError(out_error);
+    try {
+        if (core == nullptr || core->runtime == nullptr
+            || out_list == nullptr) {
+            return report(
+                Error{LS_INVALID_ARGUMENT, "core or profile output is null"},
+                out_error);
+        }
+        auto journal = core->runtime->primaryJournal();
+        if (!journal) {
+            return report(journal.error(), out_error);
+        }
+        auto profiles = journal.value()->listVoiceProfiles();
+        if (!profiles) {
+            return report(profiles.error(), out_error);
+        }
+        auto list = std::make_unique<ls_voice_profile_list>();
+        list->profiles = profiles.takeValue();
+        *out_list = list.release();
+        return LS_OK;
+    } catch (...) {
+        return reportUnknown(out_error);
+    }
+}
+
+size_t ls_voice_profile_list_count(const ls_voice_profile_list_t *list)
+{
+    try {
+        return list == nullptr ? 0 : list->profiles.size();
+    } catch (...) {
+        return 0;
+    }
+}
+
+ls_status_code_t ls_voice_profile_list_copy_v1(
+    const ls_voice_profile_list_t *list,
+    size_t index,
+    ls_voice_profile_copy_v1 *out_profile)
+{
+    try {
+        auto valid = validateStruct(out_profile);
+        if (!valid) {
+            return valid.error().code;
+        }
+        if (list == nullptr || index >= list->profiles.size()) {
+            return LS_INVALID_ARGUMENT;
+        }
+        const auto &profile = list->profiles[index];
+        out_profile->profile_id = profile.profileId;
+        out_profile->display_name = makeView(profile.displayName);
+        out_profile->embedding_model_id = makeView(profile.embeddingModelId);
+        out_profile->observation_count = profile.observationCount;
+        out_profile->created_at_unix_ns = profile.createdAtUnixNs;
+        out_profile->updated_at_unix_ns = profile.updatedAtUnixNs;
+        return LS_OK;
+    } catch (...) {
+        return LS_INTERNAL_ERROR;
+    }
+}
+
+void ls_voice_profile_list_destroy(ls_voice_profile_list_t *list)
+{
+    try {
+        delete list;
+    } catch (...) {
+    }
+}
+
+ls_status_code_t ls_core_enroll_voice_profile_v1(
+    ls_core_t *core,
+    ls_utf8_view_v1 session_id,
+    uint64_t speaker_id,
+    ls_utf8_view_v1 display_name,
+    ls_voice_profile_enrollment_v1 *out_enrollment,
+    ls_error_v1 *out_error)
+{
+    clearError(out_error);
+    try {
+        if (core == nullptr || core->runtime == nullptr) {
+            return report(
+                Error{LS_INVALID_ARGUMENT, "core is null"},
+                out_error);
+        }
+        auto valid = validateStruct(out_enrollment);
+        if (!valid) {
+            return report(valid.error(), out_error);
+        }
+        auto sessionId = copyUtf8(session_id, 128, true);
+        auto displayName = copyUtf8(display_name, 256, true);
+        if (!sessionId) {
+            return report(sessionId.error(), out_error);
+        }
+        if (!displayName) {
+            return report(displayName.error(), out_error);
+        }
+        auto journal = core->runtime->primaryJournal();
+        if (!journal) {
+            return report(journal.error(), out_error);
+        }
+        auto enrollment = journal.value()->enrollVoiceProfile(
+            sessionId.value(),
+            speaker_id,
+            displayName.value());
+        if (!enrollment) {
+            return report(enrollment.error(), out_error);
+        }
+        out_enrollment->profile_id = enrollment.value().profile.profileId;
+        out_enrollment->speaker_id = enrollment.value().speakerId;
+        out_enrollment->observation_count =
+            enrollment.value().profile.observationCount;
+        out_enrollment->relabeled_segments =
+            enrollment.value().relabeledSegments;
+        out_enrollment->journal_checkpoint =
+            enrollment.value().journalCheckpoint;
+        out_enrollment->highest_segment_revision =
+            enrollment.value().highestSegmentRevision;
+        out_enrollment->reserved = 0;
+        return LS_OK;
+    } catch (...) {
+        return reportUnknown(out_error);
+    }
+}
+
+ls_status_code_t ls_core_rename_voice_profile_v1(
+    ls_core_t *core,
+    uint64_t profile_id,
+    ls_utf8_view_v1 display_name,
+    ls_error_v1 *out_error)
+{
+    clearError(out_error);
+    try {
+        if (core == nullptr || core->runtime == nullptr) {
+            return report(
+                Error{LS_INVALID_ARGUMENT, "core is null"},
+                out_error);
+        }
+        auto displayName = copyUtf8(display_name, 256, true);
+        if (!displayName) {
+            return report(displayName.error(), out_error);
+        }
+        auto journal = core->runtime->primaryJournal();
+        if (!journal) {
+            return report(journal.error(), out_error);
+        }
+        auto renamed = journal.value()->renameVoiceProfile(
+            profile_id,
+            displayName.value());
+        return renamed ? LS_OK : report(renamed.error(), out_error);
+    } catch (...) {
+        return reportUnknown(out_error);
+    }
+}
+
+ls_status_code_t ls_core_delete_voice_profile_v1(
+    ls_core_t *core,
+    uint64_t profile_id,
+    ls_error_v1 *out_error)
+{
+    clearError(out_error);
+    try {
+        if (core == nullptr || core->runtime == nullptr) {
+            return report(
+                Error{LS_INVALID_ARGUMENT, "core is null"},
+                out_error);
+        }
+        auto journal = core->runtime->primaryJournal();
+        if (!journal) {
+            return report(journal.error(), out_error);
+        }
+        auto deleted = journal.value()->deleteVoiceProfile(profile_id);
+        return deleted ? LS_OK : report(deleted.error(), out_error);
+    } catch (...) {
+        return reportUnknown(out_error);
     }
 }
 

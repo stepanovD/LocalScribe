@@ -56,6 +56,8 @@ struct SwiftChecks {
         try await runRecoveryCheck()
         try await runMultiSessionRecoveryQueueCheck()
         try await runLifecycleResponsivenessCheck()
+        try await runVoiceProfileCheck()
+        try runLatestRequestGenerationCheck()
         try await runPreparingTerminationCheck()
         try await runBlockingModelPreparationCheck()
         try await runReversePublicationOrderCheck()
@@ -71,7 +73,7 @@ struct SwiftChecks {
         try await runDelayedRecoveryEventsDoNotGhostCheck()
         try await runCaptureBarrierCheck()
         try checkTerminationRequestCoalescing()
-        print("swift checks: 28 passed")
+        print("swift checks: 30 passed")
     }
 
     private static func require(

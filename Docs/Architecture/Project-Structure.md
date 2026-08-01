@@ -78,6 +78,7 @@ LocalScribe/
 │   ├── run-core-tests.sh
 │   ├── run-core-soak.sh
 │   ├── run-swift-checks.sh
+│   ├── run-swift-tests.sh
 │   ├── run-whisper-smoke.sh
 │   ├── verify-mvp.sh
 │   └── verify-scope.sh
@@ -130,6 +131,8 @@ backend-neutral and has no Apple dependency.
 - defines LocalScribe-owned ASR/diarization value types and interfaces;
 - contains backend factories;
 - keeps third-party headers out of public include directories;
+- seeds each diarization session with compatible saved voice profiles and keeps
+  incompatible or low-confidence observations anonymous;
 - produces partial hypotheses for UI and stable final revisions for the session.
 
 ### `Core/session`
@@ -143,7 +146,10 @@ backend-neutral and has no Apple dependency.
 
 - owns SQLite migrations and transactions;
 - persists session phase, sources, discontinuities, final segment revisions,
-  render checkpoint, and publication receipts;
+  render checkpoint, publication receipts, and bounded versioned voice-profile
+  descriptors;
+- atomically enrolls a named profile and relabels the selected session without
+  retaining raw audio;
 - discovers nonterminal sessions after a crash;
 - contains no vault or security-scoped URL logic.
 
@@ -189,6 +195,10 @@ backend-neutral and has no Apple dependency.
   of declaring a dead adapter active;
 - keeps UI responsive;
 - makes source loss and recovery visible;
+- retains an explicit current/last-call review context for saving an anonymous
+  speaker, then republishes the relabeled durable snapshot;
+- exposes profile list, rename, and delete operations to Settings without
+  putting descriptor bytes into Swift UI values;
 - retries a system stream that reports ready and then fails during restart,
   using sticky per-source mailbox health and identity-tagged workers;
 - never starts a source from a detection-only event.
@@ -235,8 +245,10 @@ test executable must compile, link, and pass without any macOS framework.
 |---|---|
 | State transitions/invariants | portable C++ unit tests |
 | SQLite migrations/recovery | portable C++ tests with temporary DB |
+| Voice-profile CRUD, format compatibility, and cross-session matching | portable C++ storage/backend/ABI tests |
 | Markdown escaping/determinism | portable golden tests |
 | ABI sizes/ownership/errors | C contract tests + Swift bridge tests |
+| Explicit enrollment and Settings management | Swift tests/checks + signed-app manual test |
 | Security-scoped bookmarks | Swift tests and signed-app manual test |
 | External-edit conflict | Swift storage tests |
 | Capture timestamps/formats | adapter contract tests |

@@ -1,6 +1,7 @@
 #include "SourceDiarizationBackend.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -12,6 +13,9 @@ constexpr std::size_t kMaximumRemoteSpeakers = 8;
 constexpr std::size_t kMaximumClusterPrototypes = 6;
 constexpr std::size_t kCandidateConfirmationObservations = 2;
 constexpr float kSpeakerMatchSimilarity = 0.87F;
+constexpr float kVoiceProfileMatchSimilarity = 0.94F;
+constexpr float kVoiceProfileContinuationSimilarity = 0.90F;
+constexpr float kVoiceProfileMatchMargin = 0.04F;
 constexpr float kContinuousVoiceAdaptationSimilarity = 0.85F;
 constexpr float kAfterPauseVoiceAdaptationSimilarity = 0.89F;
 constexpr float kCandidateConsistencySimilarity = 0.92F;
@@ -32,6 +36,10 @@ float cosineSimilarity(
     long double leftMagnitude = 0.0L;
     long double rightMagnitude = 0.0L;
     for (std::size_t index = 0; index < left.size(); ++index) {
+        if (!std::isfinite(left[index])
+            || !std::isfinite(right[index])) {
+            return -1.0F;
+        }
         dot += static_cast<long double>(left[index]) * right[index];
         leftMagnitude +=
             static_cast<long double>(left[index]) * left[index];
@@ -41,20 +49,46 @@ float cosineSimilarity(
     if (leftMagnitude <= 1.0e-12L || rightMagnitude <= 1.0e-12L) {
         return -1.0F;
     }
-    return std::clamp(
-        static_cast<float>(
-            dot / std::sqrt(leftMagnitude * rightMagnitude)),
-        -1.0F,
-        1.0F);
+    const long double similarity =
+        dot / std::sqrt(leftMagnitude * rightMagnitude);
+    if (!std::isfinite(similarity)) {
+        return -1.0F;
+    }
+    return std::clamp(static_cast<float>(similarity), -1.0F, 1.0F);
+}
+
+bool embeddingIsUsable(std::span<const float> embedding)
+{
+    if (embedding.empty()) {
+        return false;
+    }
+    long double magnitude = 0.0L;
+    for (const float value : embedding) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+        magnitude += static_cast<long double>(value) * value;
+    }
+    return std::isfinite(magnitude) && magnitude > 1.0e-12L;
+}
+
+bool sameEmbeddingModel(std::string_view left, std::string_view right)
+{
+    return left.empty() ? right.empty() : left == right;
 }
 
 void normalize(std::vector<float> &values)
 {
     long double magnitude = 0.0L;
     for (const float value : values) {
+        if (!std::isfinite(value)) {
+            values.clear();
+            return;
+        }
         magnitude += static_cast<long double>(value) * value;
     }
-    if (magnitude <= 1.0e-12L) {
+    if (!std::isfinite(magnitude) || magnitude <= 1.0e-12L) {
+        values.clear();
         return;
     }
     const float scale =
@@ -112,6 +146,18 @@ void sanitizeSpeakerNames(DiarizationConfiguration &configuration)
     }
 }
 
+bool sameSpeakerName(std::string_view left, std::string_view right)
+{
+    return left.size() == right.size()
+        && std::equal(
+            left.begin(),
+            left.end(),
+            right.begin(),
+            [](unsigned char first, unsigned char second) {
+                return std::tolower(first) == std::tolower(second);
+            });
+}
+
 } // namespace
 
 BackendInfo SourceDiarizationBackend::info() const
@@ -147,7 +193,7 @@ Expected<std::vector<SpeakerTurn>> SourceDiarizationBackend::assign(
         return validSources.error();
     }
     const std::uint64_t speakerId =
-        local.value() ? 1u : (0x8000000000000000ULL | audio.sourceId);
+        local.value() ? 1u : (kAnonymousSpeakerFlag | audio.sourceId);
     const std::string &label =
         local.value() ? configuration_.localSpeakerName
                       : configuration_.remoteSpeakerName;
@@ -182,7 +228,7 @@ SourceDiarizationBackend::flush()
 
 BackendInfo AcousticDiarizationBackend::info() const
 {
-    return BackendInfo{"acoustic-clustering", "3", false};
+    return BackendInfo{"acoustic-clustering", "4", false};
 }
 
 Expected<void> AcousticDiarizationBackend::prepare(
@@ -195,27 +241,79 @@ Expected<void> AcousticDiarizationBackend::prepare(
     previousCluster_.reset();
     pendingCandidate_.reset();
     previousEndTimeNs_ = 0;
+    nextAnonymousOrdinal_ = 1;
     forceDifferentSpeaker_ = false;
+    for (const auto &profile : configuration_.voiceProfiles) {
+        if (profile.profileId == 0
+            || profile.profileId > kSpeakerIdPayloadMask
+            || profile.displayName.empty()
+            || sameSpeakerName(
+                profile.displayName,
+                configuration_.localSpeakerName)
+            || profile.embeddingModelId.empty()
+            || profile.centroid.empty()) {
+            continue;
+        }
+        SpeakerCluster cluster;
+        cluster.speakerId = persistentSpeakerId(profile.profileId);
+        cluster.label = profile.displayName;
+        cluster.embeddingModelId = profile.embeddingModelId;
+        cluster.centroid = profile.centroid;
+        normalize(cluster.centroid);
+        if (cluster.centroid.empty()) {
+            continue;
+        }
+        for (const auto &prototype : profile.prototypes) {
+            if (prototype.size() != cluster.centroid.size()) {
+                continue;
+            }
+            auto normalized = prototype;
+            normalize(normalized);
+            if (!normalized.empty()) {
+                cluster.prototypes.push_back(std::move(normalized));
+            }
+        }
+        if (cluster.prototypes.empty()) {
+            cluster.prototypes.push_back(cluster.centroid);
+        }
+        cluster.observations = static_cast<std::size_t>(
+            std::min<std::uint64_t>(
+                profile.observationCount,
+                std::numeric_limits<std::size_t>::max()));
+        cluster.persistedProfile = true;
+        clusters_.push_back(std::move(cluster));
+    }
     prepared_ = true;
     return success();
 }
 
 std::size_t AcousticDiarizationBackend::createCluster(
-    std::span<const float> embedding)
+    std::span<const float> embedding,
+    std::string_view embeddingModelId)
 {
     SpeakerCluster cluster;
-    const std::size_t ordinal = clusters_.size() + 1;
+    const std::size_t ordinal = nextAnonymousOrdinal_++;
     cluster.speakerId =
-        0x8000000000000000ULL | static_cast<std::uint64_t>(ordinal);
+        kAnonymousSpeakerFlag | static_cast<std::uint64_t>(ordinal);
     cluster.label = ordinal == 1
         ? configuration_.remoteSpeakerName
         : "Speaker " + std::to_string(ordinal);
+    cluster.embeddingModelId = embeddingModelId;
     cluster.centroid.assign(embedding.begin(), embedding.end());
     normalize(cluster.centroid);
     if (!cluster.centroid.empty()) {
         cluster.prototypes.push_back(cluster.centroid);
     }
     cluster.observations = 0;
+    const auto reusable = std::find_if(
+        clusters_.begin(),
+        clusters_.end(),
+        [](const SpeakerCluster &existing) { return existing.retired; });
+    if (reusable != clusters_.end()) {
+        *reusable = std::move(cluster);
+        return static_cast<std::size_t>(
+            std::distance(clusters_.begin(), reusable));
+    }
     clusters_.push_back(std::move(cluster));
     return clusters_.size() - 1;
 }
@@ -223,33 +321,159 @@ std::size_t AcousticDiarizationBackend::createCluster(
 std::size_t AcousticDiarizationBackend::selectCluster(
     const AsrHypothesis &hypothesis)
 {
+    std::optional<std::size_t> reconsideredAssignment;
     if (const auto existing = assignments_.find(hypothesis.stableId);
         existing != assignments_.end()) {
-        return existing->second;
-    }
-    if (clusters_.empty()) {
-        pendingCandidate_.reset();
-        return createCluster(hypothesis.speakerEmbedding);
-    }
-
-    if (hypothesis.speakerEmbedding.empty()) {
-        pendingCandidate_.reset();
-        if (forceDifferentSpeaker_) {
-            if (clusters_.size() == 1
-                && clusters_.size() < kMaximumRemoteSpeakers) {
-                return createCluster({});
-            }
-            if (previousCluster_ && clusters_.size() > 1) {
-                return (*previousCluster_ + 1) % clusters_.size();
-            }
+        const bool sameRevision =
+            hypothesis.revision == existing->second.revision;
+        const bool hasBetterEvidence =
+            hypothesis.revision > existing->second.revision
+            || (sameRevision
+                && ((!existing->second.final && hypothesis.final)
+                    || (!existing->second.hadUsableEmbedding
+                        && embeddingIsUsable(
+                            hypothesis.speakerEmbedding))));
+        if (!hasBetterEvidence) {
+            return existing->second.cluster;
         }
-        return previousCluster_.value_or(0);
+        reconsideredAssignment = existing->second.cluster;
+    }
+    const bool honorTurnBoundary =
+        forceDifferentSpeaker_ && !reconsideredAssignment.has_value();
+    if (honorTurnBoundary) {
+        pendingCandidate_.reset();
+    }
+    const std::vector<float> profileEmbedding =
+        profileMatchEmbedding(hypothesis);
+    std::optional<std::size_t> bestProfile;
+    float bestProfileSimilarity = -std::numeric_limits<float>::infinity();
+    float secondProfileSimilarity = -std::numeric_limits<float>::infinity();
+    for (std::size_t index = 0; index < clusters_.size(); ++index) {
+        const auto &cluster = clusters_[index];
+        if (!profileIsCompatible(cluster, hypothesis)
+            || (honorTurnBoundary && previousCluster_ == index)) {
+            continue;
+        }
+        const float similarity = clusterSimilarity(
+            cluster,
+            profileEmbedding);
+        if (similarity > bestProfileSimilarity) {
+            secondProfileSimilarity = bestProfileSimilarity;
+            bestProfileSimilarity = similarity;
+            bestProfile = index;
+        } else if (similarity > secondProfileSimilarity) {
+            secondProfileSimilarity = similarity;
+        }
+    }
+    const float profileMargin =
+        std::isfinite(secondProfileSimilarity)
+        ? bestProfileSimilarity - secondProfileSimilarity
+        : std::numeric_limits<float>::infinity();
+    float strongestAnonymousSimilarity =
+        -std::numeric_limits<float>::infinity();
+    for (std::size_t index = 0; index < clusters_.size(); ++index) {
+        if (clusters_[index].persistedProfile
+            || !clusterIsCompatible(clusters_[index], hypothesis)
+            || (reconsideredAssignment == index
+                && !clusters_[index].hasMultipleEvidenceIds
+                && clusters_[index].soleEvidenceStableId
+                    == hypothesis.stableId)
+            || (honorTurnBoundary && previousCluster_ == index)) {
+            continue;
+        }
+        strongestAnonymousSimilarity = std::max(
+            strongestAnonymousSimilarity,
+            clusterSimilarity(
+                clusters_[index],
+                profileEmbedding));
+    }
+    const float anonymousMargin =
+        std::isfinite(strongestAnonymousSimilarity)
+        ? bestProfileSimilarity - strongestAnonymousSimilarity
+        : std::numeric_limits<float>::infinity();
+    if (bestProfile
+        && bestProfileSimilarity >= kVoiceProfileMatchSimilarity
+        && profileMargin >= kVoiceProfileMatchMargin
+        && anonymousMargin >= kVoiceProfileMatchMargin) {
+        pendingCandidate_.reset();
+        return *bestProfile;
     }
 
-    std::size_t bestCluster = 0;
-    float bestSimilarity = -std::numeric_limits<float>::infinity();
+    if (!honorTurnBoundary && previousCluster_
+        && clusters_[*previousCluster_].persistedProfile
+        && profileIsCompatible(
+            clusters_[*previousCluster_],
+            hypothesis)
+        && hypothesis.startTimeNs >= previousEndTimeNs_
+        && hypothesis.startTimeNs - previousEndTimeNs_
+            <= kConsecutiveSpeakerGapNs) {
+        const float previousSimilarity = clusterSimilarity(
+            clusters_[*previousCluster_],
+            profileEmbedding);
+        float strongestOther = -std::numeric_limits<float>::infinity();
+        for (std::size_t index = 0; index < clusters_.size(); ++index) {
+            if (index == *previousCluster_
+                || !clusterIsCompatible(clusters_[index], hypothesis)
+                || (reconsideredAssignment == index
+                    && !clusters_[index].hasMultipleEvidenceIds
+                    && clusters_[index].soleEvidenceStableId
+                        == hypothesis.stableId)) {
+                continue;
+            }
+            strongestOther = std::max(
+                strongestOther,
+                clusterSimilarity(
+                    clusters_[index],
+                    profileEmbedding));
+        }
+        if (previousSimilarity >= kVoiceProfileContinuationSimilarity
+            && (!std::isfinite(strongestOther)
+                || previousSimilarity - strongestOther
+                    >= kVoiceProfileMatchMargin)) {
+            pendingCandidate_.reset();
+            return *previousCluster_;
+        }
+    }
+
+    std::vector<std::size_t> anonymousClusters;
+    anonymousClusters.reserve(clusters_.size());
     for (std::size_t index = 0; index < clusters_.size(); ++index) {
-        if (forceDifferentSpeaker_ && previousCluster_ == index) {
+        if (!clusters_[index].persistedProfile
+            && !clusters_[index].retired) {
+            anonymousClusters.push_back(index);
+        }
+    }
+    if (anonymousClusters.empty()) {
+        pendingCandidate_.reset();
+        return createCluster(
+            hypothesis.speakerEmbedding,
+            hypothesis.speakerEmbeddingModel);
+    }
+
+    if (!embeddingIsUsable(hypothesis.speakerEmbedding)) {
+        pendingCandidate_.reset();
+        if (!honorTurnBoundary && previousCluster_
+            && !clusters_[*previousCluster_].persistedProfile) {
+            return *previousCluster_;
+        }
+        const auto alternative = std::find_if(
+            anonymousClusters.begin(),
+            anonymousClusters.end(),
+            [&](std::size_t index) { return previousCluster_ != index; });
+        if (alternative != anonymousClusters.end()) {
+            return *alternative;
+        }
+        if (anonymousClusterCount() < kMaximumRemoteSpeakers) {
+            return createCluster({}, hypothesis.speakerEmbeddingModel);
+        }
+        return anonymousClusters.front();
+    }
+
+    std::size_t bestCluster = anonymousClusters.front();
+    float bestSimilarity = -std::numeric_limits<float>::infinity();
+    for (const std::size_t index : anonymousClusters) {
+        if (!clusterIsCompatible(clusters_[index], hypothesis)
+            || (honorTurnBoundary && previousCluster_ == index)) {
             continue;
         }
         const float similarity = clusterSimilarity(
@@ -261,20 +485,52 @@ std::size_t AcousticDiarizationBackend::selectCluster(
         }
     }
 
-    if (forceDifferentSpeaker_) {
+    if (!std::isfinite(bestSimilarity)) {
+        const auto reusable = std::find_if(
+            anonymousClusters.begin(),
+            anonymousClusters.end(),
+            [&](std::size_t index) {
+                return clusters_[index].centroid.empty()
+                    && (!honorTurnBoundary || previousCluster_ != index);
+            });
+        if (reusable != anonymousClusters.end()) {
+            clusters_[*reusable].embeddingModelId =
+                hypothesis.speakerEmbeddingModel;
+            pendingCandidate_.reset();
+            return *reusable;
+        }
+    }
+
+    if (honorTurnBoundary) {
         pendingCandidate_.reset();
         if (std::isfinite(bestSimilarity)
             && bestSimilarity >= kSpeakerMatchSimilarity) {
             return bestCluster;
         }
-        if (clusters_.size() < kMaximumRemoteSpeakers) {
-            return createCluster(hypothesis.speakerEmbedding);
+        if (anonymousClusterCount() < kMaximumRemoteSpeakers) {
+            return createCluster(
+                hypothesis.speakerEmbedding,
+                hypothesis.speakerEmbeddingModel);
         }
         return bestCluster;
     }
 
-    if (!forceDifferentSpeaker_ && previousCluster_
-        && clusters_.size() > 1
+    if (!std::isfinite(bestSimilarity)) {
+        pendingCandidate_.reset();
+        if (anonymousClusterCount() < kMaximumRemoteSpeakers) {
+            return createCluster(
+                hypothesis.speakerEmbedding,
+                hypothesis.speakerEmbeddingModel);
+        }
+        return bestCluster;
+    }
+
+    if (previousCluster_
+        && !clusters_[*previousCluster_].persistedProfile
+        && clusterIsCompatible(
+            clusters_[*previousCluster_],
+            hypothesis)
+        && anonymousClusters.size() > 1
         && bestCluster != *previousCluster_
         && hypothesis.startTimeNs >= previousEndTimeNs_
         && hypothesis.startTimeNs - previousEndTimeNs_
@@ -297,7 +553,13 @@ std::size_t AcousticDiarizationBackend::selectCluster(
     }
 
     const std::size_t fallbackCluster =
-        previousCluster_.value_or(bestCluster);
+        previousCluster_
+            && !clusters_[*previousCluster_].persistedProfile
+            && clusterIsCompatible(
+                clusters_[*previousCluster_],
+                hypothesis)
+        ? *previousCluster_
+        : bestCluster;
     std::vector<float> normalized(
         hypothesis.speakerEmbedding.begin(),
         hypothesis.speakerEmbedding.end());
@@ -310,6 +572,9 @@ std::size_t AcousticDiarizationBackend::selectCluster(
     const bool candidateContinues =
         pendingCandidate_.has_value()
         && pendingCandidate_->fallbackCluster == fallbackCluster
+        && sameEmbeddingModel(
+            pendingCandidate_->embeddingModelId,
+            hypothesis.speakerEmbeddingModel)
         && hypothesis.startTimeNs >= pendingCandidate_->lastEndTimeNs
         && hypothesis.startTimeNs - pendingCandidate_->lastEndTimeNs
             <= kCandidateGapNs
@@ -327,6 +592,7 @@ std::size_t AcousticDiarizationBackend::selectCluster(
         pendingCandidate_ = PendingSpeakerCandidate{
             fallbackCluster,
             std::move(normalized),
+            hypothesis.speakerEmbeddingModel,
             1,
             hypothesis.endTimeNs,
             continuousFromFallback};
@@ -371,13 +637,53 @@ std::size_t AcousticDiarizationBackend::selectCluster(
         updateCluster(
             clusters_[fallbackCluster],
             confirmed,
-            adaptationSimilarity);
+            adaptationSimilarity,
+            nullptr);
         return fallbackCluster;
     }
-    if (clusters_.size() < kMaximumRemoteSpeakers) {
-        return createCluster(confirmed);
+    if (anonymousClusterCount() < kMaximumRemoteSpeakers) {
+        const std::size_t created =
+            createCluster(confirmed, hypothesis.speakerEmbeddingModel);
+        clusters_[created].hasMultipleEvidenceIds = true;
+        return created;
     }
     return bestCluster;
+}
+
+bool AcousticDiarizationBackend::profileIsCompatible(
+    const SpeakerCluster &cluster,
+    const AsrHypothesis &hypothesis) const
+{
+    return cluster.persistedProfile
+        && !hypothesis.speakerEmbeddingModel.empty()
+        && clusterIsCompatible(cluster, hypothesis);
+}
+
+bool AcousticDiarizationBackend::clusterIsCompatible(
+    const SpeakerCluster &cluster,
+    const AsrHypothesis &hypothesis) const
+{
+    if (cluster.retired
+        || !embeddingIsUsable(hypothesis.speakerEmbedding)
+        || cluster.centroid.size() != hypothesis.speakerEmbedding.size()) {
+        return false;
+    }
+    if (cluster.embeddingModelId.empty()
+        || hypothesis.speakerEmbeddingModel.empty()) {
+        return cluster.embeddingModelId.empty()
+            && hypothesis.speakerEmbeddingModel.empty();
+    }
+    return cluster.embeddingModelId == hypothesis.speakerEmbeddingModel;
+}
+
+std::size_t AcousticDiarizationBackend::anonymousClusterCount() const
+{
+    return static_cast<std::size_t>(std::count_if(
+        clusters_.begin(),
+        clusters_.end(),
+        [](const SpeakerCluster &cluster) {
+            return !cluster.persistedProfile && !cluster.retired;
+        }));
 }
 
 float AcousticDiarizationBackend::clusterSimilarity(
@@ -395,10 +701,41 @@ float AcousticDiarizationBackend::clusterSimilarity(
     return similarity;
 }
 
+std::vector<float> AcousticDiarizationBackend::profileMatchEmbedding(
+    const AsrHypothesis &hypothesis) const
+{
+    std::vector<float> result(
+        hypothesis.speakerEmbedding.begin(),
+        hypothesis.speakerEmbedding.end());
+    normalize(result);
+    if (result.empty() || !pendingCandidate_
+        || !sameEmbeddingModel(
+            pendingCandidate_->embeddingModelId,
+            hypothesis.speakerEmbeddingModel)
+        || pendingCandidate_->centroid.size() != result.size()
+        || hypothesis.startTimeNs < pendingCandidate_->lastEndTimeNs
+        || hypothesis.startTimeNs - pendingCandidate_->lastEndTimeNs
+            > kCandidateGapNs
+        || cosineSimilarity(result, pendingCandidate_->centroid)
+            < kCandidateConsistencySimilarity) {
+        return result;
+    }
+    const float retained =
+        static_cast<float>(pendingCandidate_->observations);
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        result[index] =
+            (pendingCandidate_->centroid[index] * retained + result[index])
+            / (retained + 1.0F);
+    }
+    normalize(result);
+    return result;
+}
+
 void AcousticDiarizationBackend::updateCluster(
     SpeakerCluster &cluster,
     std::span<const float> embedding,
-    float minimumSimilarity)
+    float minimumSimilarity,
+    const StableId *evidenceStableId)
 {
     if (embedding.empty()) {
         return;
@@ -410,11 +747,30 @@ void AcousticDiarizationBackend::updateCluster(
     if (normalized.empty()) {
         return;
     }
-    if (cluster.centroid.empty()
-        || cluster.centroid.size() != normalized.size()) {
+    const auto recordEvidenceOwner = [&] {
+        if (cluster.hasMultipleEvidenceIds) {
+            return;
+        }
+        if (evidenceStableId == nullptr) {
+            cluster.soleEvidenceStableId.reset();
+            cluster.hasMultipleEvidenceIds = true;
+            return;
+        }
+        if (!cluster.soleEvidenceStableId) {
+            cluster.soleEvidenceStableId = *evidenceStableId;
+        } else if (*cluster.soleEvidenceStableId != *evidenceStableId) {
+            cluster.soleEvidenceStableId.reset();
+            cluster.hasMultipleEvidenceIds = true;
+        }
+    };
+    if (cluster.centroid.empty()) {
         cluster.centroid = normalized;
         cluster.prototypes = {normalized};
         cluster.observations = 1;
+        recordEvidenceOwner();
+        return;
+    }
+    if (cluster.centroid.size() != normalized.size()) {
         return;
     }
 
@@ -423,6 +779,7 @@ void AcousticDiarizationBackend::updateCluster(
         && similarity < minimumSimilarity) {
         return;
     }
+    recordEvidenceOwner();
     const float retained = static_cast<float>(
         std::min<std::size_t>(cluster.observations, 12));
     const float incoming = 1.0F / (retained + 4.0F);
@@ -481,31 +838,104 @@ Expected<std::vector<SpeakerTurn>> AcousticDiarizationBackend::assign(
             turn.speakerLabel = configuration_.localSpeakerName;
             turn.confidence = 1.0F;
         } else {
-            const bool existingAssignment =
-                assignments_.contains(hypothesis.stableId);
-            const std::size_t selected = selectCluster(hypothesis);
-            assignments_[hypothesis.stableId] = selected;
+            const auto existing = assignments_.find(hypothesis.stableId);
+            const std::optional<SpeakerAssignment> previousAssignment =
+                existing == assignments_.end()
+                ? std::nullopt
+                : std::optional<SpeakerAssignment>{existing->second};
+            const bool usableEmbedding =
+                embeddingIsUsable(hypothesis.speakerEmbedding);
+            const bool updatesAssignment =
+                !previousAssignment
+                || hypothesis.revision > previousAssignment->revision
+                || (hypothesis.revision == previousAssignment->revision
+                    && ((!previousAssignment->final && hypothesis.final)
+                        || (!previousAssignment->hadUsableEmbedding
+                            && usableEmbedding)));
+            const std::size_t selected = updatesAssignment
+                ? selectCluster(hypothesis)
+                : previousAssignment->cluster;
+            if (updatesAssignment) {
+                assignments_[hypothesis.stableId] = SpeakerAssignment{
+                    selected,
+                    hypothesis.revision,
+                    hypothesis.final,
+                    usableEmbedding};
+            }
             auto &cluster = clusters_[selected];
-            const float similarity = clusterSimilarity(
-                cluster,
-                hypothesis.speakerEmbedding);
-            if (!existingAssignment) {
+            float similarity = clusterIsCompatible(cluster, hypothesis)
+                ? clusterSimilarity(cluster, hypothesis.speakerEmbedding)
+                : -1.0F;
+            const bool addsEvidence =
+                updatesAssignment
+                && (!previousAssignment
+                    || previousAssignment->cluster != selected
+                    || (!previousAssignment->hadUsableEmbedding
+                        && usableEmbedding));
+            const bool initializesEmptyCluster =
+                usableEmbedding && cluster.centroid.empty();
+            if (addsEvidence && !cluster.persistedProfile
+                && (clusterIsCompatible(cluster, hypothesis)
+                    || initializesEmptyCluster)) {
+                if (initializesEmptyCluster) {
+                    cluster.embeddingModelId =
+                        hypothesis.speakerEmbeddingModel;
+                }
                 updateCluster(
                     cluster,
                     hypothesis.speakerEmbedding,
-                    kSpeakerMatchSimilarity);
+                    kSpeakerMatchSimilarity,
+                    &hypothesis.stableId);
+                similarity = clusterSimilarity(
+                    cluster,
+                    hypothesis.speakerEmbedding);
+            }
+            if (updatesAssignment && previousAssignment
+                && previousAssignment->cluster != selected) {
+                auto &previous = clusters_[previousAssignment->cluster];
+                const bool stillReferenced = std::any_of(
+                    assignments_.begin(),
+                    assignments_.end(),
+                    [&](const auto &entry) {
+                        return entry.second.cluster
+                            == previousAssignment->cluster;
+                    });
+                const bool stillHasEvidence = std::any_of(
+                    assignments_.begin(),
+                    assignments_.end(),
+                    [&](const auto &entry) {
+                        return entry.second.cluster
+                                == previousAssignment->cluster
+                            && entry.second.hadUsableEmbedding;
+                    });
+                if (!previous.persistedProfile && !stillHasEvidence) {
+                    previous.retired = !stillReferenced;
+                    previous.embeddingModelId.clear();
+                    previous.centroid.clear();
+                    previous.prototypes.clear();
+                    previous.soleEvidenceStableId.reset();
+                    previous.hasMultipleEvidenceIds = false;
+                    previous.observations = 0;
+                    if (pendingCandidate_
+                        && pendingCandidate_->fallbackCluster
+                            == previousAssignment->cluster) {
+                        pendingCandidate_.reset();
+                    }
+                }
             }
             turn.speakerId = cluster.speakerId;
             turn.speakerLabel = cluster.label;
-            turn.confidence = hypothesis.speakerEmbedding.empty()
+            turn.confidence = !usableEmbedding
                 ? 0.60F
                 : std::clamp(
                     (std::max(similarity, 0.50F) - 0.50F) * 2.0F,
                     0.50F,
                     0.95F);
-            previousCluster_ = selected;
-            previousEndTimeNs_ = hypothesis.endTimeNs;
-            forceDifferentSpeaker_ = hypothesis.speakerTurnAfter;
+            if (updatesAssignment) {
+                previousCluster_ = selected;
+                previousEndTimeNs_ = hypothesis.endTimeNs;
+                forceDifferentSpeaker_ = hypothesis.speakerTurnAfter;
+            }
         }
         turns.push_back(std::move(turn));
     }

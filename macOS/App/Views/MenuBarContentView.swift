@@ -1,11 +1,19 @@
+import Foundation
 import SwiftUI
 
 struct MenuBarContentView: View {
     @ObservedObject var model: AppModel
+    @State private var speakerDraftNames: [UInt64: String] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+            if let failure = model.voiceProfileFailure {
+                Label(failure, systemImage: "person.crop.circle.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Divider()
             content
             Divider()
@@ -25,6 +33,9 @@ struct MenuBarContentView: View {
         .frame(width: 340)
         .task {
             await model.refreshSetupState()
+        }
+        .onChange(of: model.session.sessionID) { _, _ in
+            speakerDraftNames.removeAll()
         }
     }
 
@@ -64,6 +75,7 @@ struct MenuBarContentView: View {
                 Label(failureText(failure), systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
+            speakerProfiles
             Button {
                 model.requestManualStart()
             } label: {
@@ -108,6 +120,7 @@ struct MenuBarContentView: View {
 
         case .recording:
             sourceRows
+            speakerProfiles
             if let metrics = model.session.metrics {
                 Text(
                     "Processing queue: \(metrics.audioQueueDepth) / high \(metrics.audioQueueHighWater)"
@@ -131,6 +144,7 @@ struct MenuBarContentView: View {
 
         case .paused:
             sourceRows
+            speakerProfiles
             Text("Capture is paused. Already accepted audio is still journaled.")
                 .font(.callout)
             HStack {
@@ -222,6 +236,105 @@ struct MenuBarContentView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var speakerProfiles: some View {
+        if !model.session.speakers.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Speakers")
+                    .font(.headline)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.session.speakers) { speaker in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Label(
+                                        speaker.displayName,
+                                        systemImage: speaker.isAnonymous
+                                            ? "person.wave.2"
+                                            : "person.crop.circle.badge.checkmark"
+                                    )
+                                    .font(.subheadline.weight(.medium))
+                                    Spacer()
+                                    Text(
+                                        "\(speaker.segmentCount) "
+                                            + (speaker.segmentCount == 1
+                                                ? "segment"
+                                                : "segments")
+                                    )
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                }
+
+                                if !speaker.latestExcerpt.isEmpty {
+                                    Text(speaker.latestExcerpt)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+
+                                if speaker.isAnonymous {
+                                    HStack {
+                                        TextField(
+                                            "Name this speaker",
+                                            text: speakerDraftBinding(
+                                                for: speaker.speakerID
+                                            )
+                                        )
+                                        .textFieldStyle(.roundedBorder)
+                                        .accessibilityLabel(
+                                            "Name for \(speaker.displayName)"
+                                        )
+                                        Button("Save") {
+                                            model.saveVoiceProfile(
+                                                sessionID: speaker.sessionID,
+                                                speakerID: speaker.speakerID,
+                                                displayName:
+                                                    speakerDraftNames[
+                                                        speaker.speakerID
+                                                    ] ?? ""
+                                            )
+                                        }
+                                        .disabled(
+                                            model.isVoiceProfileOperationInProgress
+                                                || speakerDraftNames[
+                                                    speaker.speakerID
+                                                ]?.trimmingCharacters(
+                                                    in: .whitespacesAndNewlines
+                                                ).isEmpty != false
+                                        )
+                                    }
+                                } else {
+                                    Text("Recognized from a saved voice profile")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(7)
+                            .background(
+                                .quaternary,
+                                in: RoundedRectangle(cornerRadius: 7)
+                            )
+                        }
+                    }
+                }
+                .frame(maxHeight: 280)
+                Text(
+                    "Saved voice profiles stay on this Mac and are used for future transcripts."
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func speakerDraftBinding(for speakerID: UInt64) -> Binding<String> {
+        Binding(
+            get: { speakerDraftNames[speakerID] ?? "" },
+            set: { speakerDraftNames[speakerID] = $0 }
+        )
     }
 
     private func sourceRow(

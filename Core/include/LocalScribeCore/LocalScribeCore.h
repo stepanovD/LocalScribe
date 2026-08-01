@@ -28,6 +28,7 @@ typedef struct ls_session ls_session_t;
 typedef struct ls_event ls_event_t;
 typedef struct ls_owned_bytes ls_owned_bytes_t;
 typedef struct ls_recovery_list ls_recovery_list_t;
+typedef struct ls_voice_profile_list ls_voice_profile_list_t;
 
 /*
  * Public enum values use an explicit int32_t carrier so their ABI does not
@@ -332,6 +333,30 @@ typedef struct {
     uint32_t reserved;
 } ls_transcript_segment_copy_v1;
 
+/* UTF-8 views remain valid until ls_voice_profile_list_destroy(). */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t profile_id;
+    ls_utf8_view_v1 display_name;
+    ls_utf8_view_v1 embedding_model_id;
+    uint64_t observation_count;
+    int64_t created_at_unix_ns;
+    int64_t updated_at_unix_ns;
+} ls_voice_profile_copy_v1;
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t profile_id;
+    uint64_t speaker_id;
+    uint64_t observation_count;
+    uint32_t relabeled_segments;
+    uint64_t journal_checkpoint;
+    uint32_t highest_segment_revision;
+    uint32_t reserved;
+} ls_voice_profile_enrollment_v1;
+
 typedef struct {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -465,6 +490,41 @@ LS_CORE_API ls_status_code_t ls_recovery_list_session_id_v1(
     ls_utf8_view_v1 *out_session_id);
 
 LS_CORE_API void ls_recovery_list_destroy(ls_recovery_list_t *list);
+
+LS_CORE_API ls_status_code_t ls_core_list_voice_profiles_v1(
+    ls_core_t *core,
+    ls_voice_profile_list_t **out_list,
+    ls_error_v1 *out_error);
+
+LS_CORE_API size_t
+ls_voice_profile_list_count(const ls_voice_profile_list_t *list);
+
+LS_CORE_API ls_status_code_t ls_voice_profile_list_copy_v1(
+    const ls_voice_profile_list_t *list,
+    size_t index,
+    ls_voice_profile_copy_v1 *out_profile);
+
+LS_CORE_API void
+ls_voice_profile_list_destroy(ls_voice_profile_list_t *list);
+
+LS_CORE_API ls_status_code_t ls_core_enroll_voice_profile_v1(
+    ls_core_t *core,
+    ls_utf8_view_v1 session_id,
+    uint64_t speaker_id,
+    ls_utf8_view_v1 display_name,
+    ls_voice_profile_enrollment_v1 *out_enrollment,
+    ls_error_v1 *out_error);
+
+LS_CORE_API ls_status_code_t ls_core_rename_voice_profile_v1(
+    ls_core_t *core,
+    uint64_t profile_id,
+    ls_utf8_view_v1 display_name,
+    ls_error_v1 *out_error);
+
+LS_CORE_API ls_status_code_t ls_core_delete_voice_profile_v1(
+    ls_core_t *core,
+    uint64_t profile_id,
+    ls_error_v1 *out_error);
 
 LS_CORE_API ls_status_code_t ls_core_open_recoverable_session_v1(
     ls_core_t *core,

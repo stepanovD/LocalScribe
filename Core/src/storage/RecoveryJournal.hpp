@@ -37,6 +37,11 @@ public:
     [[nodiscard]] Expected<std::uint64_t>
     appendFinalSegment(
         const std::string &sessionId,
+        TranscriptSegment &segment);
+
+    [[nodiscard]] Expected<std::uint64_t>
+    appendFinalSegment(
+        const std::string &sessionId,
         const TranscriptSegment &segment);
 
     [[nodiscard]] Expected<std::uint64_t>
@@ -64,6 +69,20 @@ public:
     [[nodiscard]] Expected<JournalSnapshot>
     snapshot(const std::string &sessionId);
 
+    [[nodiscard]] Expected<std::vector<VoiceProfile>> listVoiceProfiles();
+
+    [[nodiscard]] Expected<VoiceProfileEnrollment> enrollVoiceProfile(
+        const std::string &sessionId,
+        std::uint64_t speakerId,
+        const std::string &displayName);
+
+    [[nodiscard]] Expected<void> renameVoiceProfile(
+        std::uint64_t profileId,
+        const std::string &displayName);
+
+    [[nodiscard]] Expected<void> deleteVoiceProfile(
+        std::uint64_t profileId);
+
     [[nodiscard]] Expected<void>
     acknowledgePublication(
         const std::string &sessionId,
@@ -84,6 +103,9 @@ private:
 
     [[nodiscard]] Expected<SessionRecord>
     loadSessionLocked(const std::string &sessionId);
+
+    [[nodiscard]] Expected<VoiceProfile>
+    loadVoiceProfileLocked(std::uint64_t profileId);
 
     sqlite3 *database_{};
     std::string path_;

@@ -16,6 +16,7 @@ struct DiarizationConfiguration {
     std::uint64_t systemAudioSourceId{2};
     std::string localSpeakerName{"Me"};
     std::string remoteSpeakerName{"Speaker 1"};
+    std::vector<VoiceProfile> voiceProfiles;
 };
 
 class IDiarizationBackend {

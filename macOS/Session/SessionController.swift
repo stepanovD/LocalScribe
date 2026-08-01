@@ -62,6 +62,17 @@ enum SessionFailureCode: String, Sendable {
     case internalFailure
 }
 
+struct SessionSpeakerSnapshot: Sendable, Equatable, Identifiable {
+    let sessionID: UUID
+    let speakerID: UInt64
+    let displayName: String
+    let segmentCount: Int
+    let latestExcerpt: String
+    let isAnonymous: Bool
+
+    var id: UInt64 { speakerID }
+}
+
 struct SessionSnapshot: Sendable {
     let state: SessionShellState
     let sessionID: UUID?
@@ -70,6 +81,7 @@ struct SessionSnapshot: Sendable {
     let systemAudio: SourceDisplayState
     let metrics: CorePipelineMetrics?
     let recentFinalSegments: [CoreTranscriptSegment]
+    let speakers: [SessionSpeakerSnapshot]
     let lastPublicationDestination: PublicationDestination?
     let lastPublishedFilename: String?
     let lastPublishedURL: URL?
@@ -83,6 +95,7 @@ struct SessionSnapshot: Sendable {
         systemAudio: .unknown,
         metrics: nil,
         recentFinalSegments: [],
+        speakers: [],
         lastPublicationDestination: nil,
         lastPublishedFilename: nil,
         lastPublishedURL: nil,
@@ -118,6 +131,29 @@ actor SessionController {
         let sourceGaps: [TerminationSourceGap]
     }
 
+    private struct SessionReviewContext: Sendable {
+        let sessionID: UUID
+        let request: SessionStartRequest
+        let createdAt: Date
+        let endedAt: Date
+        let microphoneCaptured: Bool
+        let systemAudioCaptured: Bool
+    }
+
+    private struct SpeakerAccumulator {
+        var displayName: String
+        var segmentCount: Int
+        var firstStartTimeNanoseconds: Int64
+        var latestEndTimeNanoseconds: Int64
+        var latestExcerpt: String
+    }
+
+    private struct VoiceProfileEnrollmentTarget {
+        let sessionID: UUID
+        let activeGeneration: UInt64?
+        let reviewContext: SessionReviewContext?
+    }
+
     nonisolated let updates: AsyncStream<SessionSnapshot>
 
     private let updateContinuation: AsyncStream<SessionSnapshot>.Continuation
@@ -144,6 +180,14 @@ actor SessionController {
     private var consumedConsentIDs = Set<UUID>()
     private var activeRequest: SessionStartRequest?
     private var activeCreatedAt: Date?
+    private var lastReviewContext: SessionReviewContext?
+    private var observedFinalSegments: [UUID: CoreTranscriptSegment] = [:]
+    private var speakerAliases:
+        [UInt64: (speakerID: UInt64, displayName: String)] = [:]
+    private var reviewPublicationTask: Task<Void, Never>?
+    private var reviewPublicationWorkerID: UUID?
+    private var reviewPublicationContext: SessionReviewContext?
+    private var reviewPublicationDirty = false
     private var intentionalCaptureStop = false
     private var sourceUnavailableSince: [CaptureSourceKind: Int64] = [:]
     private var sourceRecoveryTasks:
@@ -322,6 +366,9 @@ actor SessionController {
             session = coreSession
             activeRequest = request
             activeCreatedAt = createdAt
+            lastReviewContext = nil
+            observedFinalSegments.removeAll(keepingCapacity: true)
+            speakerAliases.removeAll(keepingCapacity: true)
             sourceUnavailableSince.removeAll()
             cancelSourceRecoveryTasks()
             sourcesBeingRestarted.removeAll()
@@ -359,6 +406,7 @@ actor SessionController {
                 systemAudio: .active,
                 metrics: nil,
                 recentFinalSegments: [],
+                speakers: [],
                 lastPublicationDestination: nil,
                 lastPublishedFilename: nil,
                 lastPublishedURL: nil,
@@ -484,9 +532,19 @@ actor SessionController {
             guard terminalState.phase.isTerminal else {
                 throw SessionControllerError.invalidTransition
             }
+            await drainFinalEventsThroughTerminalBoundary(
+                from: session,
+                generation: generation
+            )
+            guard generation == activeGeneration else {
+                intentionalCaptureStop = false
+                return
+            }
             applyCorePhase(terminalState.phase)
+            let endedAt = Date()
+            rememberReviewContext(endedAt: endedAt)
             await publishTerminalSnapshotBounded(
-                endedAt: Date(),
+                endedAt: endedAt,
                 generation: generation
             )
             finishTerminalSession()
@@ -545,6 +603,98 @@ actor SessionController {
 
     func currentPermissionSnapshot() async -> CapturePermissionSnapshot {
         await permissions.currentSnapshot()
+    }
+
+    func voiceProfiles() async throws -> [CoreVoiceProfile] {
+        let client = coreClient
+        return try await Task.detached(priority: .utility) {
+            try client.listVoiceProfiles()
+        }.value
+    }
+
+    @discardableResult
+    func enrollVoiceProfile(
+        sessionID expectedSessionID: UUID,
+        speakerID: UInt64,
+        displayName: String
+    ) async throws -> CoreVoiceProfileEnrollment {
+        guard voiceProfileEnrollmentTarget(
+            expectedSessionID: expectedSessionID
+        ) != nil else {
+            throw SessionControllerError.invalidTransition
+        }
+
+        await acquireLifecycleSlot()
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, speakerID != 1,
+              let target = voiceProfileEnrollmentTarget(
+                  expectedSessionID: expectedSessionID
+              )
+        else {
+            releaseLifecycleSlot()
+            throw SessionControllerError.invalidTransition
+        }
+
+        let client = coreClient
+        let enrollment: CoreVoiceProfileEnrollment
+        do {
+            enrollment = try await Task.detached(priority: .userInitiated) {
+                try client.enrollVoiceProfile(
+                    sessionID: target.sessionID,
+                    speakerID: speakerID,
+                    displayName: name
+                )
+            }.value
+        } catch {
+            releaseLifecycleSlot()
+            throw error
+        }
+
+        applyEnrollment(
+            enrollment,
+            originalSpeakerID: speakerID,
+            displayName: name,
+            sessionID: target.sessionID
+        )
+        releaseLifecycleSlot()
+
+        if let generation = target.activeGeneration,
+           generation == activeGeneration,
+           session != nil,
+           snapshot.sessionID == target.sessionID
+        {
+            schedulePublication(
+                generation: generation,
+                delayNanoseconds: 0
+            )
+        } else if let reviewContext = target.reviewContext {
+            scheduleReviewPublication(reviewContext)
+        }
+        return enrollment
+    }
+
+    func renameVoiceProfile(
+        profileID: UInt64,
+        displayName: String
+    ) async throws {
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            throw SessionControllerError.invalidTransition
+        }
+        let client = coreClient
+        try await Task.detached(priority: .utility) {
+            try client.renameVoiceProfile(
+                profileID: profileID,
+                displayName: name
+            )
+        }.value
+    }
+
+    func deleteVoiceProfile(profileID: UInt64) async throws {
+        let client = coreClient
+        try await Task.detached(priority: .utility) {
+            try client.deleteVoiceProfile(profileID: profileID)
+        }.value
     }
 
     /// Recovers durable journal sessions without touching consent, TCC,
@@ -852,11 +1002,56 @@ actor SessionController {
                 } catch CoreBridgeError.closed {
                     return
                 } catch {
+                    guard !Task.isCancelled else {
+                        return
+                    }
                     await self?.receiveCorePollFailure(
                         generation: generation
                     )
                     return
                 }
+            }
+        }
+    }
+
+    private func drainFinalEventsThroughTerminalBoundary(
+        from coreSession: any CoreSessionProtocol,
+        generation: UInt64
+    ) async {
+        let pollingTask = eventPollTask
+        eventPollTask = nil
+        pollingTask?.cancel()
+        if let pollingTask {
+            await pollingTask.value
+        }
+
+        guard generation == activeGeneration, session != nil else {
+            return
+        }
+        while true {
+            let event: CoreEvent?
+            do {
+                event = try coreSession.nextEvent(timeoutMilliseconds: 0)
+            } catch {
+                return
+            }
+            guard let event else {
+                return
+            }
+            switch event {
+            case let .finalSegment(segment):
+                if segment.isFinal {
+                    recordFinalSegment(segment)
+                }
+            case let .metrics(metrics):
+                snapshot = replacingSnapshot(metrics: metrics)
+                emit()
+            case let .sourceChanged(source):
+                applySourceEvent(source)
+            case .terminal:
+                return
+            case .stateChanged, .error:
+                continue
             }
         }
     }
@@ -907,18 +1102,15 @@ actor SessionController {
                 return
             }
             applyCorePhase(state.phase)
+            guard !terminalPublicationClaimed else {
+                return
+            }
             await handleTerminalEvent(state, generation: generation)
         case let .finalSegment(segment):
             guard segment.isFinal else {
                 return
             }
-            var recent = snapshot.recentFinalSegments
-            recent.append(segment)
-            if recent.count > 3 {
-                recent.removeFirst(recent.count - 3)
-            }
-            snapshot = replacingSnapshot(recentFinalSegments: recent)
-            emit()
+            recordFinalSegment(segment)
             schedulePublication(generation: generation)
         case let .metrics(metrics):
             snapshot = replacingSnapshot(metrics: metrics)
@@ -926,6 +1118,9 @@ actor SessionController {
         case let .sourceChanged(event):
             applySourceEvent(event)
         case .error:
+            guard !terminalPublicationClaimed else {
+                return
+            }
             await receiveCorePollFailure(generation: generation)
         }
     }
@@ -953,8 +1148,10 @@ actor SessionController {
         guard generation == activeGeneration else {
             return
         }
+        let endedAt = Date()
+        rememberReviewContext(endedAt: endedAt)
         await publishTerminalSnapshotBounded(
-            endedAt: Date(),
+            endedAt: endedAt,
             generation: generation
         )
         guard generation == activeGeneration else {
@@ -964,12 +1161,21 @@ actor SessionController {
     }
 
     private func receiveCorePollFailure(generation: UInt64) async {
+        guard !terminalPublicationClaimed else {
+            return
+        }
         await acquireLifecycleSlot()
         defer { releaseLifecycleSlot() }
 
-        guard session != nil, generation == activeGeneration else {
+        guard !terminalPublicationClaimed,
+              session != nil,
+              generation == activeGeneration
+        else {
             return
         }
+        // This callback is running on the poll task itself. Relinquish the
+        // stored handle before interruption drains the now-exclusive queue.
+        eventPollTask = nil
         await interruptActiveSession(code: .coreUnavailable)
     }
 
@@ -1263,6 +1469,323 @@ actor SessionController {
         }
     }
 
+    private func recordFinalSegment(_ incoming: CoreTranscriptSegment) {
+        let segment = applyingSpeakerAlias(to: incoming)
+        if let existing = observedFinalSegments[segment.stableID],
+           existing.revision > segment.revision
+        {
+            return
+        }
+        observedFinalSegments[segment.stableID] = segment
+        rebuildSpeakerSnapshot()
+        emit()
+    }
+
+    private func voiceProfileEnrollmentTarget(
+        expectedSessionID: UUID
+    ) -> VoiceProfileEnrollmentTarget? {
+        if snapshot.sessionID == expectedSessionID,
+           session != nil,
+           activeRequest != nil,
+           activeCreatedAt != nil
+        {
+            return VoiceProfileEnrollmentTarget(
+                sessionID: expectedSessionID,
+                activeGeneration: activeGeneration,
+                reviewContext: nil
+            )
+        }
+        guard let context = lastReviewContext,
+              context.sessionID == expectedSessionID,
+              session == nil
+        else {
+            return nil
+        }
+        return VoiceProfileEnrollmentTarget(
+            sessionID: expectedSessionID,
+            activeGeneration: nil,
+            reviewContext: context
+        )
+    }
+
+    private func applyingSpeakerAlias(
+        to segment: CoreTranscriptSegment
+    ) -> CoreTranscriptSegment {
+        guard let alias = speakerAliases[segment.speakerID] else {
+            return segment
+        }
+        return CoreTranscriptSegment(
+            stableID: segment.stableID,
+            sourceID: segment.sourceID,
+            startTimeNanoseconds: segment.startTimeNanoseconds,
+            endTimeNanoseconds: segment.endTimeNanoseconds,
+            speakerID: alias.speakerID,
+            speakerLabel: alias.displayName,
+            text: segment.text,
+            language: segment.language,
+            confidence: segment.confidence,
+            revision: segment.revision,
+            isFinal: segment.isFinal,
+            isUnintelligible: segment.isUnintelligible
+        )
+    }
+
+    private func rebuildSpeakerSnapshot() {
+        let ordered = observedFinalSegments.values.sorted { left, right in
+            if left.startTimeNanoseconds != right.startTimeNanoseconds {
+                return left.startTimeNanoseconds < right.startTimeNanoseconds
+            }
+            if left.endTimeNanoseconds != right.endTimeNanoseconds {
+                return left.endTimeNanoseconds < right.endTimeNanoseconds
+            }
+            return left.stableID.uuidString < right.stableID.uuidString
+        }
+        guard let sessionID = snapshot.sessionID else {
+            snapshot = replacingSnapshot(
+                recentFinalSegments: Array(ordered.suffix(3)),
+                speakers: []
+            )
+            return
+        }
+        var speakers: [UInt64: SpeakerAccumulator] = [:]
+        for segment in ordered where segment.speakerID != 1 {
+            if var current = speakers[segment.speakerID] {
+                current.segmentCount += 1
+                if segment.endTimeNanoseconds >= current.latestEndTimeNanoseconds {
+                    current.displayName = segment.speakerLabel
+                    current.latestEndTimeNanoseconds = segment.endTimeNanoseconds
+                    current.latestExcerpt = segment.text
+                }
+                speakers[segment.speakerID] = current
+            } else {
+                speakers[segment.speakerID] = SpeakerAccumulator(
+                    displayName: segment.speakerLabel,
+                    segmentCount: 1,
+                    firstStartTimeNanoseconds: segment.startTimeNanoseconds,
+                    latestEndTimeNanoseconds: segment.endTimeNanoseconds,
+                    latestExcerpt: segment.text
+                )
+            }
+        }
+        let speakerSnapshots = speakers.map { speakerID, value in
+            SessionSpeakerSnapshot(
+                sessionID: sessionID,
+                speakerID: speakerID,
+                displayName: value.displayName,
+                segmentCount: value.segmentCount,
+                latestExcerpt: value.latestExcerpt,
+                isAnonymous:
+                    speakerID & (UInt64(1) << 63) != 0
+            )
+        }.sorted { left, right in
+            let leftStart = speakers[left.speakerID]?.firstStartTimeNanoseconds
+                ?? Int64.max
+            let rightStart = speakers[right.speakerID]?.firstStartTimeNanoseconds
+                ?? Int64.max
+            if leftStart != rightStart {
+                return leftStart < rightStart
+            }
+            return left.speakerID < right.speakerID
+        }
+        snapshot = replacingSnapshot(
+            recentFinalSegments: Array(ordered.suffix(3)),
+            speakers: speakerSnapshots
+        )
+    }
+
+    private func applyEnrollment(
+        _ enrollment: CoreVoiceProfileEnrollment,
+        originalSpeakerID: UInt64,
+        displayName: String,
+        sessionID: UUID
+    ) {
+        guard snapshot.sessionID == sessionID else {
+            return
+        }
+        let alias = (
+            speakerID: enrollment.speakerID,
+            displayName: displayName
+        )
+        speakerAliases[originalSpeakerID] = alias
+        speakerAliases[enrollment.speakerID] = alias
+        observedFinalSegments = observedFinalSegments.mapValues { segment in
+            guard segment.speakerID == originalSpeakerID
+                    || segment.speakerID == enrollment.speakerID
+            else {
+                return segment
+            }
+            return applyingSpeakerAlias(to: segment)
+        }
+        rebuildSpeakerSnapshot()
+        emit()
+    }
+
+    private func rememberReviewContext(endedAt: Date) {
+        guard let sessionID = snapshot.sessionID,
+              let request = activeRequest,
+              let createdAt = activeCreatedAt
+        else {
+            return
+        }
+        lastReviewContext = SessionReviewContext(
+            sessionID: sessionID,
+            request: request,
+            createdAt: createdAt,
+            endedAt: endedAt,
+            microphoneCaptured: snapshot.microphone == .active
+                || snapshot.microphone == .ready,
+            systemAudioCaptured: snapshot.systemAudio == .active
+                || snapshot.systemAudio == .ready
+        )
+    }
+
+    private func scheduleReviewPublication(
+        _ context: SessionReviewContext
+    ) {
+        reviewPublicationContext = context
+        reviewPublicationDirty = true
+        guard reviewPublicationTask == nil else {
+            return
+        }
+
+        let workerID = UUID()
+        reviewPublicationWorkerID = workerID
+        reviewPublicationTask = Task { [weak self] in
+            await self?.runReviewPublicationWorker(workerID: workerID)
+        }
+    }
+
+    private func runReviewPublicationWorker(workerID: UUID) async {
+        while !Task.isCancelled,
+              reviewPublicationWorkerID == workerID,
+              reviewPublicationDirty,
+              let context = reviewPublicationContext
+        {
+            reviewPublicationDirty = false
+            let published = await publishReviewSnapshotBounded(context)
+            if !published, snapshot.sessionID == context.sessionID {
+                updateFailureOnly(.publicationUnavailable)
+            }
+        }
+        guard reviewPublicationWorkerID == workerID else {
+            return
+        }
+        reviewPublicationTask = nil
+        reviewPublicationWorkerID = nil
+        reviewPublicationContext = nil
+        reviewPublicationDirty = false
+    }
+
+    private func publishReviewSnapshotBounded(
+        _ context: SessionReviewContext
+    ) async -> Bool {
+        let completion = PublicationAttemptCompletion()
+        let task = Task { [weak self] in
+            let success = await self?.publishReviewSnapshot(context) ?? false
+            completion.complete(success)
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        while clock.now < deadline {
+            if let result = completion.result {
+                return result
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        task.cancel()
+        return false
+    }
+
+    private func publishReviewSnapshot(
+        _ context: SessionReviewContext
+    ) async -> Bool {
+        let client = coreClient
+        let reopened: any CoreSessionProtocol
+        do {
+            reopened = try await Task.detached(priority: .userInitiated) {
+                try client.openRecoverableSession(
+                    id: context.sessionID.uuidString.lowercased()
+                )
+            }.value
+        } catch {
+            return false
+        }
+        defer {
+            Task.detached(priority: .utility) {
+                reopened.close()
+            }
+        }
+        guard !Task.isCancelled else {
+            return false
+        }
+
+        do {
+            let duration = Int64(
+                max(0, context.endedAt.timeIntervalSince(context.createdAt))
+            )
+            let rendered = try await Task.detached(priority: .userInitiated) {
+                try reopened.renderMarkdown(
+                    options: CoreMarkdownOptions(
+                        title: context.request.title,
+                        createdAt: context.createdAt,
+                        endedAt: context.endedAt,
+                        durationSeconds: duration,
+                        microphoneCaptured: context.microphoneCaptured,
+                        systemAudioCaptured: context.systemAudioCaptured
+                    )
+                )
+            }.value
+            guard !Task.isCancelled else {
+                return false
+            }
+            let previous = await vaultWriter.latestReceipt(
+                for: context.sessionID
+            )
+            guard !Task.isCancelled else {
+                return false
+            }
+            let publicationSequence = reservePublicationSequence()
+            let receipt = try await vaultWriter.publish(
+                MarkdownPublicationRequest(
+                    sessionID: context.sessionID,
+                    preferredFilenameStem:
+                        context.request.preferredFilenameStem,
+                    markdown: rendered.data,
+                    highestSegmentRevision:
+                        UInt64(rendered.highestSegmentRevision),
+                    publicationSequence: publicationSequence,
+                    expectedPrevious: previous?.fingerprint
+                )
+            )
+            guard !Task.isCancelled else {
+                return false
+            }
+            try await Task.detached(priority: .userInitiated) {
+                try reopened.acknowledgePublication(
+                    receipt: receipt,
+                    journalCheckpoint: rendered.journalCheckpoint
+                )
+            }.value
+            guard !Task.isCancelled else {
+                return false
+            }
+            if snapshot.sessionID == context.sessionID {
+                snapshot = replacingSnapshot(
+                    destination: receipt.destination,
+                    filename: receipt.filename,
+                    url: receipt.url,
+                    clearFailure:
+                        snapshot.failureCode == .publicationUnavailable
+                )
+                emit()
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func schedulePublication(
         generation: UInt64,
         delayNanoseconds: UInt64 = 500_000_000
@@ -1496,18 +2019,22 @@ actor SessionController {
         intentionalCaptureStop = true
         await stopCaptureAdapters()
         intentionalCaptureStop = false
-        if let session {
-            try? closeOutstandingSourceGaps(on: session)
-        }
-        if let session {
+        if let activeSession = session {
+            try? closeOutstandingSourceGaps(on: activeSession)
             _ = try? await Task.detached(priority: .userInitiated) {
-                try session.finalize(reason: .processInterrupted)
-                return try session.currentState()
+                try activeSession.finalize(reason: .processInterrupted)
+                return try activeSession.currentState()
             }.value
+            await drainFinalEventsThroughTerminalBoundary(
+                from: activeSession,
+                generation: generation
+            )
         }
         update(state: .interrupted, failure: code)
+        let endedAt = Date()
+        rememberReviewContext(endedAt: endedAt)
         await publishTerminalSnapshotBounded(
-            endedAt: Date(),
+            endedAt: endedAt,
             generation: generation
         )
         finishTerminalSession()
@@ -1677,6 +2204,12 @@ actor SessionController {
     }
 
     private func failStart(_ code: SessionFailureCode) {
+        if let context = lastReviewContext,
+           snapshot.sessionID == context.sessionID
+        {
+            update(state: .failedToStart, failure: code)
+            return
+        }
         snapshot = SessionSnapshot(
             state: .failedToStart,
             sessionID: nil,
@@ -1685,6 +2218,7 @@ actor SessionController {
             systemAudio: .unknown,
             metrics: nil,
             recentFinalSegments: [],
+            speakers: [],
             lastPublicationDestination: nil,
             lastPublishedFilename: nil,
             lastPublishedURL: nil,
@@ -1764,6 +2298,7 @@ actor SessionController {
             systemAudio: kind == .systemAudio ? state : snapshot.systemAudio,
             metrics: snapshot.metrics,
             recentFinalSegments: snapshot.recentFinalSegments,
+            speakers: snapshot.speakers,
             lastPublicationDestination: snapshot.lastPublicationDestination,
             lastPublishedFilename: snapshot.lastPublishedFilename,
             lastPublishedURL: snapshot.lastPublishedURL,
@@ -1784,6 +2319,7 @@ actor SessionController {
             systemAudio: snapshot.systemAudio,
             metrics: snapshot.metrics,
             recentFinalSegments: snapshot.recentFinalSegments,
+            speakers: snapshot.speakers,
             lastPublicationDestination: snapshot.lastPublicationDestination,
             lastPublishedFilename: snapshot.lastPublishedFilename,
             lastPublishedURL: snapshot.lastPublishedURL,
@@ -1800,6 +2336,7 @@ actor SessionController {
     private func replacingSnapshot(
         metrics: CorePipelineMetrics? = nil,
         recentFinalSegments: [CoreTranscriptSegment]? = nil,
+        speakers: [SessionSpeakerSnapshot]? = nil,
         destination: PublicationDestination? = nil,
         filename: String? = nil,
         url: URL? = nil,
@@ -1815,6 +2352,7 @@ actor SessionController {
             metrics: metrics ?? snapshot.metrics,
             recentFinalSegments:
                 recentFinalSegments ?? snapshot.recentFinalSegments,
+            speakers: speakers ?? snapshot.speakers,
             lastPublicationDestination:
                 destination ?? snapshot.lastPublicationDestination,
             lastPublishedFilename: filename ?? snapshot.lastPublishedFilename,
@@ -1842,6 +2380,7 @@ actor SessionController {
             systemAudio: .unknown,
             metrics: metrics,
             recentFinalSegments: [],
+            speakers: [],
             lastPublicationDestination: destination,
             lastPublishedFilename: filename,
             lastPublishedURL: url,

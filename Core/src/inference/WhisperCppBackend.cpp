@@ -393,6 +393,10 @@ public:
                     SpeakerFeatureExtractor::extract(
                         samples.subspan(begin, end - begin),
                         kWhisperSampleRate);
+                if (!hypothesis.speakerEmbedding.empty()) {
+                    hypothesis.speakerEmbeddingModel =
+                        std::string{kSpeakerFeatureModelId};
+                }
             }
             result.push_back(std::move(hypothesis));
         }

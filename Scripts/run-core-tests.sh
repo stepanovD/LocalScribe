@@ -25,6 +25,7 @@ clang++ \
     "$repo_root/Core/tests/JournalRecoveryTests.cpp" \
     "$repo_root/Core/tests/MarkdownGoldenTests.cpp" \
     "$repo_root/Core/tests/StateMachineTests.cpp" \
+    "$repo_root/Core/tests/VoiceProfileTests.cpp" \
     -lsqlite3 \
     -pthread \
     -o "$test_binary"

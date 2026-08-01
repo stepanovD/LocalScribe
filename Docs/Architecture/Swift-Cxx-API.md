@@ -288,6 +288,33 @@ an older attempt after a newer attempt has begun. This prevents a cancelled
 live `recording` snapshot whose URL resolution finishes late from overwriting a
 terminal snapshot.
 
+## Voice-profile lifecycle
+
+The C facade exposes core-scoped list, enroll, rename, and delete operations.
+Enrollment accepts a durable session ID, an anonymous remote `speaker_id`, and a
+UTF-8 display name. It does not accept raw audio or descriptor bytes from Swift:
+the core derives a bounded profile from embeddings already committed with that
+session's final segments. The result returns the persistent profile/speaker IDs,
+observation count, relabeled-segment count, and exact render checkpoint needed
+to republish the selected call.
+
+Profile-list values expose only profile ID, display name, and observation count.
+Centroids, prototypes, embedding dimensions, and embedding model/version remain
+private C++/SQLite values and never enter the UI bridge. List ownership follows
+the same opaque-handle/copy/destroy convention as recovery lists.
+
+Speaker IDs use disjoint namespaces: `1` remains the microphone owner,
+anonymous per-session remote speakers carry the high bit, and persisted
+profiles carry the next-highest bit. Swift treats these IDs as opaque. The
+diarization backend compares a persisted profile only with the same embedding
+model/version and dimension, requires a stricter match plus separation from the
+runner-up, and otherwise retains an anonymous label.
+
+Enrollment and relabeling commit atomically. Swift then reopens/renders the
+current or last reviewable session and publishes the returned checkpoint using
+the normal conflict-safe writer. Rename and delete affect future matching and
+do not trigger a global historical-file rewrite.
+
 ## C++ backend contracts
 
 The backend contracts are internal C++ interfaces, not ABI:
@@ -363,6 +390,8 @@ VaultWriter actor ── security scope / conflict check / atomic publish
   `ls_session_copy_state_v1`;
 - Capture adapters never call `VaultWriter`.
 - `VaultWriter` never reads audio or invokes inference.
+- profile UI values contain IDs, names, and counts only; acoustic descriptor
+  bytes stay behind the C facade;
 - at most one live publication worker is tracked per session; updates coalesce,
   terminal publication has a bounded wait, and an exact unacknowledged terminal
   snapshot remains recoverable from SQLite;

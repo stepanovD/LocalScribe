@@ -141,6 +141,106 @@ final class CoreClient: @unchecked Sendable, CoreClientProtocol {
         )
     }
 
+    func listVoiceProfiles() throws -> [CoreVoiceProfile] {
+        let core = try currentHandle()
+        var list: OpaquePointer?
+        var error = ls_error_v1()
+        initializeABIHeader(&error)
+        try check(
+            ls_core_list_voice_profiles_v1(
+                core,
+                &list,
+                &error
+            )
+        )
+        guard let list else {
+            return []
+        }
+        defer { ls_voice_profile_list_destroy(list) }
+
+        let count = ls_voice_profile_list_count(list)
+        return try (0..<count).map { index in
+            var value = ls_voice_profile_copy_v1()
+            initializeABIHeader(&value)
+            try check(
+                ls_voice_profile_list_copy_v1(
+                    list,
+                    index,
+                    &value
+                )
+            )
+            return CoreVoiceProfile(
+                profileID: value.profile_id,
+                displayName: try copyUTF8(value.display_name),
+                sampleCount: value.observation_count
+            )
+        }
+    }
+
+    func enrollVoiceProfile(
+        sessionID: UUID,
+        speakerID: UInt64,
+        displayName: String
+    ) throws -> CoreVoiceProfileEnrollment {
+        let core = try currentHandle()
+        var enrollment = ls_voice_profile_enrollment_v1()
+        initializeABIHeader(&enrollment)
+        var error = ls_error_v1()
+        initializeABIHeader(&error)
+        let status: ls_status_code_t = withUTF8Views(
+            [sessionID.uuidString.lowercased(), displayName]
+        ) { views in
+            ls_core_enroll_voice_profile_v1(
+                core,
+                views[0],
+                speakerID,
+                views[1],
+                &enrollment,
+                &error
+            )
+        }
+        try check(status)
+        return CoreVoiceProfileEnrollment(
+            profileID: enrollment.profile_id,
+            speakerID: enrollment.speaker_id,
+            sampleCount: enrollment.observation_count,
+            relabeledSegments: enrollment.relabeled_segments,
+            journalCheckpoint: enrollment.journal_checkpoint,
+            highestSegmentRevision: enrollment.highest_segment_revision
+        )
+    }
+
+    func renameVoiceProfile(
+        profileID: UInt64,
+        displayName: String
+    ) throws {
+        let core = try currentHandle()
+        var error = ls_error_v1()
+        initializeABIHeader(&error)
+        let status: ls_status_code_t = withUTF8Views([displayName]) { views in
+            ls_core_rename_voice_profile_v1(
+                core,
+                profileID,
+                views[0],
+                &error
+            )
+        }
+        try check(status)
+    }
+
+    func deleteVoiceProfile(profileID: UInt64) throws {
+        let core = try currentHandle()
+        var error = ls_error_v1()
+        initializeABIHeader(&error)
+        try check(
+            ls_core_delete_voice_profile_v1(
+                core,
+                profileID,
+                &error
+            )
+        )
+    }
+
     private func currentHandle() throws -> OpaquePointer {
         lock.lock()
         defer { lock.unlock() }
