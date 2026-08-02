@@ -67,6 +67,54 @@ git push -u origin main
 не принимает обычные Git-объекты размером более 100 MiB; модели распознавания
 следует распространять отдельно, а не через этот репозиторий.
 
+## Технический GitHub pre-release
+
+Для небольшой группы технических тестировщиков можно создать ad hoc-подписанный
+DMG одной командой:
+
+```sh
+Scripts/build-github-release.sh
+```
+
+Скрипт запускает `verify-mvp.sh`, после него обязательно пересобирает
+оптимизированный release bundle, создаёт DMG в `dist/`, проверяет образ и
+записывает рядом SHA-256. Имя артефакта формируется из версии в
+`Config/Info.plist` и фактической архитектуры приложения, например:
+
+```text
+dist/LocalScribe-0.1.0-macOS-arm64.dmg
+dist/LocalScribe-0.1.0-macOS-arm64.dmg.sha256
+```
+
+Существующий артефакт той же версии по умолчанию не перезаписывается. Для
+повторной внутренней сборки используйте:
+
+```sh
+Scripts/build-github-release.sh --overwrite
+```
+
+Если полный набор проверок уже был успешно выполнен для текущего коммита,
+его можно явно пропустить:
+
+```sh
+Scripts/build-github-release.sh --skip-verify --overwrite
+```
+
+Отдельный упаковщик не пересобирает приложение и полезен после ручной release
+сборки:
+
+```sh
+Scripts/build-app-bundle.sh release
+Scripts/package-app-dmg.sh
+```
+
+Загрузите оба файла из `dist/` в GitHub Release и отметьте релиз как
+**Pre-release**. Тестировщик должен перенести LocalScribe в `/Applications`,
+один раз попытаться открыть его, затем выбрать **System Settings → Privacy &
+Security → Open Anyway**. Модель Whisper в DMG не входит. После обновления ad
+hoc-подпись изменится, поэтому macOS может снова запросить Microphone и Screen
+Recording.
+
 ## Публичный релиз приложения
 
 Скрипт `Scripts/build-app-bundle.sh` создаёт ad hoc-подписанную локальную сборку.
