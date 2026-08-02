@@ -96,6 +96,24 @@ struct MenuBarContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
                 HStack {
+                    Text("Meeting language")
+                    Spacer()
+                    Picker(
+                        "Meeting language",
+                        selection: $model.meetingLanguageMode
+                    ) {
+                        ForEach(
+                            CoreLanguageMode.selectableCases,
+                            id: \.rawValue
+                        ) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                HStack {
                     Button("Not Now") {
                         model.dismissStart()
                     }

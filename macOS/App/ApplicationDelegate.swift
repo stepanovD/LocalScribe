@@ -52,12 +52,15 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         // @Published delivers the new value from willSet. Consume the emitted
         // values directly instead of reading model properties that still hold
         // their previous values inside this callback.
-        Publishers.CombineLatest3(
+        Publishers.CombineLatest4(
             model.$detectedCallProposal,
             model.$hasVaultSelection,
-            model.$hasModelSelection
+            model.$hasModelSelection,
+            model.$meetingLanguageMode
         )
-            .sink { [weak self, weak model] proposal, hasVault, hasModel in
+            .sink {
+                [weak self, weak model]
+                proposal, hasVault, hasModel, languageMode in
                 guard let self, let model else {
                     return
                 }
@@ -65,7 +68,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
                     proposal: proposal,
                     canStart: model.isRecordingEngineAvailable
                         && hasVault
-                        && hasModel
+                        && hasModel,
+                    languageMode: languageMode
                 )
             }
             .store(in: &modelSubscriptions)
@@ -73,7 +77,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshCallPrompt(
         proposal: DetectedCallProposal?,
-        canStart: Bool
+        canStart: Bool,
+        languageMode: CoreLanguageMode
     ) {
         guard let model, let proposal else {
             callPrompt.close()
@@ -83,6 +88,10 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         callPrompt.show(
             proposal: proposal,
             canStart: canStart,
+            languageMode: languageMode,
+            onLanguageChange: { [weak model] mode in
+                model?.meetingLanguageMode = mode
+            },
             onStart: { [weak model] in
                 model?.confirmDetectedCallStart(proposalID: proposal.id)
             },

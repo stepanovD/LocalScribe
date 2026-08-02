@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class DetectedCallPromptWindowController: NSObject {
     private enum Layout {
-        static let windowSize = NSSize(width: 420, height: 96)
+        static let windowSize = NSSize(width: 540, height: 96)
         static let horizontalScreenInset: CGFloat = 4
         static let verticalScreenInset: CGFloat = 2
         static let entryOffset: CGFloat = 8
@@ -21,6 +21,8 @@ final class DetectedCallPromptWindowController: NSObject {
     func show(
         proposal: DetectedCallProposal,
         canStart: Bool,
+        languageMode: CoreLanguageMode,
+        onLanguageChange: @escaping (CoreLanguageMode) -> Void,
         onStart: @escaping () -> Void,
         onDismiss: @escaping () -> Void
     ) {
@@ -39,6 +41,8 @@ final class DetectedCallPromptWindowController: NSObject {
         let rootView = DetectedCallPromptView(
             applicationName: proposal.applicationName,
             canStart: canStart,
+            languageMode: languageMode,
+            onLanguageChange: onLanguageChange,
             onStart: { [weak self] in
                 self?.resolveWithStart()
             },
@@ -226,6 +230,8 @@ private final class DetectedCallBannerPanel: NSPanel {
 private struct DetectedCallPromptView: View {
     let applicationName: String
     let canStart: Bool
+    let languageMode: CoreLanguageMode
+    let onLanguageChange: (CoreLanguageMode) -> Void
     let onStart: () -> Void
     let onDismiss: () -> Void
 
@@ -260,6 +266,27 @@ private struct DetectedCallPromptView: View {
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(.isHeader)
 
+            Picker(
+                "Meeting language",
+                selection: Binding(
+                    get: { languageMode },
+                    set: { mode in
+                        onLanguageChange(mode)
+                    }
+                )
+            ) {
+                ForEach(
+                    CoreLanguageMode.selectableCases,
+                    id: \.rawValue
+                ) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 108)
+            .help("Language for this meeting")
+
             Button("Start recording", action: onStart)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -291,7 +318,7 @@ private struct DetectedCallPromptView: View {
             )
         }
         .padding(.horizontal, 14)
-        .frame(width: 396, height: 72)
+        .frame(width: 516, height: 72)
         .background(cardBackground, in: RoundedRectangle(
             cornerRadius: 18,
             style: .continuous
@@ -302,7 +329,7 @@ private struct DetectedCallPromptView: View {
         }
         .shadow(color: .black.opacity(0.20), radius: 10, y: 5)
         .padding(12)
-        .frame(width: 420, height: 96)
+        .frame(width: 540, height: 96)
     }
 
     private var subtitle: String {

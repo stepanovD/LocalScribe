@@ -16,9 +16,16 @@ final class AppModel: ObservableObject {
     @Published private(set) var voiceProfileFailure: String?
     @Published private(set) var isVoiceProfileOperationInProgress = false
     @Published private(set) var detectedCallProposal: DetectedCallProposal?
+    @Published var defaultLanguageMode: CoreLanguageMode {
+        didSet {
+            languagePreferences.defaultLanguageMode = defaultLanguageMode
+        }
+    }
+    @Published var meetingLanguageMode: CoreLanguageMode
 
     private let directoryStore: SecurityScopedDirectoryStore
     private let modelStore: SecurityScopedModelStore
+    private let languagePreferences: TranscriptLanguagePreferences
     private let controller: SessionController?
     private let callDetectionMonitor: CallDetectionMonitor
     private let consentIssuer = VisibleConsentIssuer()
@@ -30,9 +37,14 @@ final class AppModel: ObservableObject {
     init() {
         let directoryStore = SecurityScopedDirectoryStore()
         let modelStore = SecurityScopedModelStore()
+        let languagePreferences = TranscriptLanguagePreferences()
+        let defaultLanguageMode = languagePreferences.defaultLanguageMode
         let callDetectionMonitor = CallDetectionMonitor()
         self.directoryStore = directoryStore
         self.modelStore = modelStore
+        self.languagePreferences = languagePreferences
+        self.defaultLanguageMode = defaultLanguageMode
+        meetingLanguageMode = defaultLanguageMode
         self.callDetectionMonitor = callDetectionMonitor
 
         let applicationSupport = URL.applicationSupportDirectory
@@ -137,6 +149,7 @@ final class AppModel: ObservableObject {
             setupFailure = .coreUnavailable
             return
         }
+        meetingLanguageMode = defaultLanguageMode
         Task {
             do {
                 try await controller.proposeManualStart()
@@ -198,7 +211,7 @@ final class AppModel: ObservableObject {
             preferredFilenameStem:
                 "\(filenameFormatter.string(from: now)) — \(callName)",
             localSpeakerName: "Me",
-            languageMode: .russianEnglish
+            languageMode: meetingLanguageMode
         )
         Task {
             await controller.start(
@@ -573,6 +586,7 @@ final class AppModel: ObservableObject {
             )
             return
         }
+        meetingLanguageMode = defaultLanguageMode
         detectedCallProposal = proposal
     }
 

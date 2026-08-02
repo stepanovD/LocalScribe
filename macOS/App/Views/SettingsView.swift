@@ -42,6 +42,23 @@ struct SettingsView: View {
                 )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Picker(
+                    "Default meeting language",
+                    selection: $model.defaultLanguageMode
+                ) {
+                    ForEach(
+                        CoreLanguageMode.selectableCases,
+                        id: \.rawValue
+                    ) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                Text(
+                    "This language is preselected for new meetings. You can change it before starting an individual recording."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Section("Voice profiles") {
