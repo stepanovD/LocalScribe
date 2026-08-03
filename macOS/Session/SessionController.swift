@@ -140,6 +140,13 @@ actor SessionController {
         let systemAudioCaptured: Bool
     }
 
+    private enum ReviewPublicationResult: Sendable {
+        case published
+        case superseded
+        case cancelled
+        case failed(SessionFailureCode)
+    }
+
     private struct SpeakerAccumulator {
         var displayName: String
         var segmentCount: Int
@@ -188,6 +195,8 @@ actor SessionController {
     private var reviewPublicationWorkerID: UUID?
     private var reviewPublicationContext: SessionReviewContext?
     private var reviewPublicationDirty = false
+    private var reviewPublicationReportedFailure: SessionFailureCode?
+    private var failureBeforeReviewPublication: SessionFailureCode?
     private var intentionalCaptureStop = false
     private var sourceUnavailableSince: [CaptureSourceKind: Int64] = [:]
     private var sourceRecoveryTasks:
@@ -381,6 +390,8 @@ actor SessionController {
             activeRequest = request
             activeCreatedAt = createdAt
             lastReviewContext = nil
+            reviewPublicationReportedFailure = nil
+            failureBeforeReviewPublication = nil
             observedFinalSegments.removeAll(keepingCapacity: true)
             speakerAliases.removeAll(keepingCapacity: true)
             sourceUnavailableSince.removeAll()
@@ -710,6 +721,31 @@ actor SessionController {
         try await Task.detached(priority: .utility) {
             try client.deleteVoiceProfile(profileID: profileID)
         }.value
+    }
+
+    func retryLastPublication() throws {
+        guard !terminationRequested else {
+            throw SessionControllerError.invalidTransition
+        }
+        if session != nil,
+           !terminalPublicationClaimed,
+           activeRequest != nil,
+           activeCreatedAt != nil,
+           snapshot.sessionID != nil
+        {
+            schedulePublication(
+                generation: activeGeneration,
+                delayNanoseconds: 0
+            )
+            return
+        }
+        guard let context = lastReviewContext,
+              session == nil,
+              snapshot.sessionID == context.sessionID
+        else {
+            throw SessionControllerError.invalidTransition
+        }
+        scheduleReviewPublication(context)
     }
 
     /// Recovers durable journal sessions without touching consent, TCC,
@@ -1677,9 +1713,31 @@ actor SessionController {
               let context = reviewPublicationContext
         {
             reviewPublicationDirty = false
-            let published = await publishReviewSnapshotBounded(context)
-            if !published, snapshot.sessionID == context.sessionID {
-                updateFailureOnly(.publicationUnavailable)
+            // This worker is not awaited by Stop, Quit, or capture lifecycle
+            // transitions. Its expensive core calls are detached and the
+            // writer is asynchronous, so awaiting real completion here keeps
+            // the controller reentrant without imposing a transcript-size
+            // deadline on review publication.
+            let result = await publishReviewSnapshot(context)
+            guard reviewPublicationWorkerID == workerID else {
+                return
+            }
+            switch result {
+            case .published:
+                if snapshot.sessionID == context.sessionID {
+                    clearReportedReviewPublicationFailure()
+                }
+            case let .failed(failure):
+                // A newer enrollment or explicit retry is already queued.
+                // Avoid flashing an error for an attempt whose replacement
+                // has not had a chance to publish yet.
+                if !reviewPublicationDirty,
+                   snapshot.sessionID == context.sessionID
+                {
+                    reportReviewPublicationFailure(failure)
+                }
+            case .superseded, .cancelled:
+                break
             }
         }
         guard reviewPublicationWorkerID == workerID else {
@@ -1691,30 +1749,9 @@ actor SessionController {
         reviewPublicationDirty = false
     }
 
-    private func publishReviewSnapshotBounded(
-        _ context: SessionReviewContext
-    ) async -> Bool {
-        let completion = PublicationAttemptCompletion()
-        let task = Task { [weak self] in
-            let success = await self?.publishReviewSnapshot(context) ?? false
-            completion.complete(success)
-        }
-
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(3))
-        while clock.now < deadline {
-            if let result = completion.result {
-                return result
-            }
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        task.cancel()
-        return false
-    }
-
     private func publishReviewSnapshot(
         _ context: SessionReviewContext
-    ) async -> Bool {
+    ) async -> ReviewPublicationResult {
         let client = coreClient
         let reopened: any CoreSessionProtocol
         do {
@@ -1724,7 +1761,9 @@ actor SessionController {
                 )
             }.value
         } catch {
-            return false
+            return Task.isCancelled
+                ? .cancelled
+                : .failed(.coreUnavailable)
         }
         defer {
             Task.detached(priority: .utility) {
@@ -1732,14 +1771,15 @@ actor SessionController {
             }
         }
         guard !Task.isCancelled else {
-            return false
+            return .cancelled
         }
 
+        let rendered: CoreRenderedMarkdown
         do {
             let duration = Int64(
                 max(0, context.endedAt.timeIntervalSince(context.createdAt))
             )
-            let rendered = try await Task.detached(priority: .userInitiated) {
+            rendered = try await Task.detached(priority: .userInitiated) {
                 try reopened.renderMarkdown(
                     options: CoreMarkdownOptions(
                         title: context.request.title,
@@ -1751,17 +1791,23 @@ actor SessionController {
                     )
                 )
             }.value
-            guard !Task.isCancelled else {
-                return false
-            }
-            let previous = await vaultWriter.latestReceipt(
-                for: context.sessionID
-            )
-            guard !Task.isCancelled else {
-                return false
-            }
-            let publicationSequence = reservePublicationSequence()
-            let receipt = try await vaultWriter.publish(
+        } catch {
+            return Task.isCancelled
+                ? .cancelled
+                : .failed(.coreUnavailable)
+        }
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+
+        let previous = await vaultWriter.latestReceipt(for: context.sessionID)
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+        let publicationSequence = reservePublicationSequence()
+        let receipt: MarkdownPublicationReceipt
+        do {
+            receipt = try await vaultWriter.publish(
                 MarkdownPublicationRequest(
                     sessionID: context.sessionID,
                     preferredFilenameStem:
@@ -1773,32 +1819,78 @@ actor SessionController {
                     expectedPrevious: previous?.fingerprint
                 )
             )
-            guard !Task.isCancelled else {
-                return false
-            }
+        } catch VaultWriterError.publicationSuperseded {
+            return .superseded
+        } catch {
+            return Task.isCancelled
+                ? .cancelled
+                : .failed(.publicationUnavailable)
+        }
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+
+        do {
             try await Task.detached(priority: .userInitiated) {
                 try reopened.acknowledgePublication(
                     receipt: receipt,
                     journalCheckpoint: rendered.journalCheckpoint
                 )
             }.value
-            guard !Task.isCancelled else {
-                return false
-            }
-            if snapshot.sessionID == context.sessionID {
-                snapshot = replacingSnapshot(
-                    destination: receipt.destination,
-                    filename: receipt.filename,
-                    url: receipt.url,
-                    clearFailure:
-                        snapshot.failureCode == .publicationUnavailable
-                )
+        } catch {
+            return Task.isCancelled
+                ? .cancelled
+                : .failed(.coreUnavailable)
+        }
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+        if snapshot.sessionID == context.sessionID {
+            snapshot = replacingSnapshot(
+                destination: receipt.destination,
+                filename: receipt.filename,
+                url: receipt.url,
+                clearFailure: false
+            )
+            emit()
+        }
+        return .published
+    }
+
+    private func reportReviewPublicationFailure(
+        _ failure: SessionFailureCode
+    ) {
+        if reviewPublicationReportedFailure == nil {
+            failureBeforeReviewPublication =
+                snapshot.failureCode == .publicationUnavailable
+                    ? nil
+                    : snapshot.failureCode
+        }
+        reviewPublicationReportedFailure = failure
+        updateFailureOnly(failure)
+    }
+
+    private func clearReportedReviewPublicationFailure() {
+        let reportedFailure = reviewPublicationReportedFailure
+        let previousFailure = failureBeforeReviewPublication
+        reviewPublicationReportedFailure = nil
+        failureBeforeReviewPublication = nil
+
+        guard let reportedFailure else {
+            if snapshot.failureCode == .publicationUnavailable {
+                snapshot = replacingSnapshot(clearFailure: true)
                 emit()
             }
-            return true
-        } catch {
-            return false
+            return
         }
+        guard snapshot.failureCode == reportedFailure else {
+            return
+        }
+        snapshot = replacingSnapshot(
+            failure: previousFailure,
+            clearFailure: previousFailure == nil
+        )
+        emit()
     }
 
     private func schedulePublication(

@@ -1605,6 +1605,19 @@ func runVoiceProfileCheck() async throws {
             "terminal enrollment waited for a blocked transcript publication"
         )
     }
+    try await Task.sleep(for: .milliseconds(3_200))
+    let slowReviewSnapshot = await controller.currentSnapshot()
+    guard slowReviewSnapshot.failureCode == nil else {
+        await writer.releaseBlockedPublication()
+        secondEnrollmentTask.cancel()
+        _ = try? await secondEnrollmentTask.value
+        throw LifecycleCheckError.invariant(
+            "slow background review publication was reported as a failure"
+        )
+    }
+    try await controller.retryLastPublication()
+    try await controller.retryLastPublication()
+    try await controller.retryLastPublication()
     let secondEnrollment = try await secondEnrollmentTask.value
     let thirdEnrollment = try await controller.enrollVoiceProfile(
         sessionID: sessionID,

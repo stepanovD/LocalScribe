@@ -21,6 +21,7 @@ constexpr float kAfterPauseVoiceAdaptationSimilarity = 0.89F;
 constexpr float kCandidateConsistencySimilarity = 0.92F;
 constexpr float kConsecutiveSpeakerSimilarity = 0.84F;
 constexpr float kConsecutiveSpeakerMargin = 0.04F;
+constexpr float kExplicitTurnContinuationSimilarity = 0.97F;
 constexpr float kPrototypeAdmissionSimilarity = 0.995F;
 constexpr std::int64_t kConsecutiveSpeakerGapNs = 2'000'000'000;
 constexpr std::int64_t kCandidateGapNs = 5'000'000'000;
@@ -228,7 +229,7 @@ SourceDiarizationBackend::flush()
 
 BackendInfo AcousticDiarizationBackend::info() const
 {
-    return BackendInfo{"acoustic-clustering", "4", false};
+    return BackendInfo{"acoustic-clustering", "5", false};
 }
 
 Expected<void> AcousticDiarizationBackend::prepare(
@@ -391,6 +392,30 @@ std::size_t AcousticDiarizationBackend::selectCluster(
         std::isfinite(strongestAnonymousSimilarity)
         ? bestProfileSimilarity - strongestAnonymousSimilarity
         : std::numeric_limits<float>::infinity();
+    if (honorTurnBoundary && previousCluster_
+        && clusterIsCompatible(
+            clusters_[*previousCluster_],
+            hypothesis)) {
+        const float previousSimilarity = clusterSimilarity(
+            clusters_[*previousCluster_],
+            profileEmbedding);
+        const float strongestAlternative = std::max(
+            bestProfileSimilarity,
+            strongestAnonymousSimilarity);
+        if (previousSimilarity
+                >= kExplicitTurnContinuationSimilarity
+            && (!std::isfinite(strongestAlternative)
+                || previousSimilarity - strongestAlternative
+                    >= kConsecutiveSpeakerMargin)) {
+            /*
+             * TinyDiarize turn markers are useful hints, not proof of a new
+             * identity. A near-identical acoustic signature with no close
+             * alternative is stronger evidence that this was a false turn.
+             */
+            pendingCandidate_.reset();
+            return *previousCluster_;
+        }
+    }
     if (bestProfile
         && bestProfileSimilarity >= kVoiceProfileMatchSimilarity
         && profileMargin >= kVoiceProfileMatchMargin
@@ -462,6 +487,15 @@ std::size_t AcousticDiarizationBackend::selectCluster(
             [&](std::size_t index) { return previousCluster_ != index; });
         if (alternative != anonymousClusters.end()) {
             return *alternative;
+        }
+        if (previousCluster_
+            && !clusters_[*previousCluster_].persistedProfile) {
+            /*
+             * A turn hint without acoustic evidence must not manufacture a
+             * new speaker. Keep the existing anonymous identity until a
+             * voiced segment can support a split.
+             */
+            return *previousCluster_;
         }
         if (anonymousClusterCount() < kMaximumRemoteSpeakers) {
             return createCluster({}, hypothesis.speakerEmbeddingModel);

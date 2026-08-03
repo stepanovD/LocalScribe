@@ -13,6 +13,7 @@ struct MenuBarContentView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(2)
             }
             Divider()
             content
@@ -29,8 +30,14 @@ struct MenuBarContentView: View {
                 .keyboardShortcut("q")
             }
         }
-        .padding(14)
-        .frame(width: 340)
+        .padding(16)
+        .frame(width: 500)
+        .frame(
+            minHeight: model.session.speakers.isEmpty ? 420 : 680,
+            idealHeight: model.session.speakers.isEmpty ? 480 : 740,
+            maxHeight: model.session.speakers.isEmpty ? 560 : 780,
+            alignment: .topLeading
+        )
         .task {
             await model.refreshSetupState()
         }
@@ -74,6 +81,8 @@ struct MenuBarContentView: View {
             if let failure = model.session.failureCode ?? model.setupFailure {
                 Label(failureText(failure), systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(2)
             }
             speakerProfiles
             Button {
@@ -250,6 +259,19 @@ struct MenuBarContentView: View {
                 )
                 .foregroundStyle(.orange)
             }
+            if canRetryPublication {
+                Button {
+                    model.retryLastPublication()
+                } label: {
+                    Label(
+                        "Retry Transcript Update",
+                        systemImage: "arrow.clockwise"
+                    )
+                }
+                .accessibilityHint(
+                    "Retries updating the transcript without saving the voice profile again"
+                )
+            }
             if model.session.lastPublishedURL != nil {
                 Button {
                     model.openLastTranscript()
@@ -274,8 +296,8 @@ struct MenuBarContentView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(model.session.speakers) { speaker in
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
+                            VStack(alignment: .leading, spacing: 7) {
+                                VStack(alignment: .leading, spacing: 2) {
                                     Label(
                                         speaker.displayName,
                                         systemImage: speaker.isAnonymous
@@ -283,16 +305,15 @@ struct MenuBarContentView: View {
                                             : "person.crop.circle.badge.checkmark"
                                     )
                                     .font(.subheadline.weight(.medium))
-                                    Spacer()
-                                    Text(
-                                        "\(speaker.segmentCount) "
-                                            + (speaker.segmentCount == 1
-                                                ? "segment"
-                                                : "segments")
-                                    )
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+
+                                    Text(segmentCountText(speaker.segmentCount))
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
+                                .accessibilityElement(children: .combine)
 
                                 if !speaker.latestExcerpt.isEmpty {
                                     Text(speaker.latestExcerpt)
@@ -302,34 +323,57 @@ struct MenuBarContentView: View {
                                 }
 
                                 if speaker.isAnonymous {
-                                    HStack {
-                                        TextField(
-                                            "Name this speaker",
-                                            text: speakerDraftBinding(
-                                                for: speaker.speakerID
+                                    TextField(
+                                        "Name this speaker",
+                                        text: speakerDraftBinding(
+                                            for: speaker.speakerID
+                                        )
+                                    )
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(maxWidth: .infinity)
+                                    .accessibilityLabel(
+                                        "Name for \(speaker.displayName)"
+                                    )
+
+                                    HStack(spacing: 8) {
+                                        if !model.voiceProfiles.isEmpty {
+                                            Menu {
+                                                ForEach(model.voiceProfiles) { profile in
+                                                    Button(profile.displayName) {
+                                                        attach(
+                                                            speaker,
+                                                            to: profile
+                                                        )
+                                                    }
+                                                    .accessibilityLabel(
+                                                        "Attach \(speaker.displayName) to \(profile.displayName)"
+                                                    )
+                                                }
+                                            } label: {
+                                                Label(
+                                                    "Attach to Saved Profile…",
+                                                    systemImage: "person.2"
+                                                )
+                                            }
+                                            .disabled(
+                                                model.isVoiceProfileOperationInProgress
                                             )
-                                        )
-                                        .textFieldStyle(.roundedBorder)
-                                        .accessibilityLabel(
-                                            "Name for \(speaker.displayName)"
-                                        )
-                                        Button("Save") {
-                                            model.saveVoiceProfile(
-                                                sessionID: speaker.sessionID,
-                                                speakerID: speaker.speakerID,
-                                                displayName:
-                                                    speakerDraftNames[
-                                                        speaker.speakerID
-                                                    ] ?? ""
+                                            .accessibilityLabel(
+                                                "Attach \(speaker.displayName) to a saved profile"
+                                            )
+                                            .accessibilityHint(
+                                                "Adds this speaker's voice samples to an existing saved profile"
                                             )
                                         }
-                                        .disabled(
-                                            model.isVoiceProfileOperationInProgress
-                                                || speakerDraftNames[
-                                                    speaker.speakerID
-                                                ]?.trimmingCharacters(
-                                                    in: .whitespacesAndNewlines
-                                                ).isEmpty != false
+
+                                        Spacer(minLength: 8)
+
+                                        Button("Save Name") {
+                                            saveVoiceProfile(for: speaker)
+                                        }
+                                        .disabled(!canSaveVoiceProfile(for: speaker))
+                                        .accessibilityLabel(
+                                            "Save name for \(speaker.displayName)"
                                         )
                                     }
                                 } else {
@@ -346,7 +390,7 @@ struct MenuBarContentView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 280)
+                .frame(minHeight: 260, idealHeight: 340, maxHeight: 420)
                 Text(
                     "Saved voice profiles stay on this Mac and are used for future transcripts."
                 )
@@ -361,6 +405,39 @@ struct MenuBarContentView: View {
         Binding(
             get: { speakerDraftNames[speakerID] ?? "" },
             set: { speakerDraftNames[speakerID] = $0 }
+        )
+    }
+
+    private func segmentCountText(_ segmentCount: Int) -> String {
+        "\(segmentCount) \(segmentCount == 1 ? "segment" : "segments")"
+    }
+
+    private func canSaveVoiceProfile(
+        for speaker: SessionSpeakerSnapshot
+    ) -> Bool {
+        !model.isVoiceProfileOperationInProgress
+            && speakerDraftNames[speaker.speakerID]?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty == false
+    }
+
+    private func saveVoiceProfile(for speaker: SessionSpeakerSnapshot) {
+        model.saveVoiceProfile(
+            sessionID: speaker.sessionID,
+            speakerID: speaker.speakerID,
+            displayName: speakerDraftNames[speaker.speakerID] ?? ""
+        )
+    }
+
+    private func attach(
+        _ speaker: SessionSpeakerSnapshot,
+        to profile: CoreVoiceProfile
+    ) {
+        speakerDraftNames[speaker.speakerID] = profile.displayName
+        model.saveVoiceProfile(
+            sessionID: speaker.sessionID,
+            speakerID: speaker.speakerID,
+            displayName: profile.displayName
         )
     }
 
@@ -414,6 +491,20 @@ struct MenuBarContentView: View {
         return "Create a local transcript?"
     }
 
+    private var canRetryPublication: Bool {
+        guard model.session.failureCode == .publicationUnavailable
+                || model.session.failureCode == .coreUnavailable
+        else {
+            return false
+        }
+        switch model.session.state {
+        case .complete, .incompleteSources, .interrupted:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func failureText(_ failure: SessionFailureCode) -> String {
         switch failure {
         case .vaultNotSelected:
@@ -427,9 +518,13 @@ struct MenuBarContentView: View {
         case .captureUnavailable:
             "One of the required audio sources is unavailable."
         case .publicationUnavailable:
-            "The transcript could not be published to the vault."
+            "The transcript update could not be written to the selected folder or local safety storage."
         case .coreUnavailable:
-            "The local transcription engine is unavailable."
+            if canRetryPublication {
+                "The transcript update could not be rendered or confirmed. Its journal and saved voice profiles remain on this Mac."
+            } else {
+                "The local transcription engine is unavailable."
+            }
         case .consentExpired:
             "Consent expired. Please start again."
         case .consentAlreadyUsed, .invalidTransition, .internalFailure:

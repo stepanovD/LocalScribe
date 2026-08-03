@@ -498,7 +498,43 @@ LS_TEST(acoustic_diarization_ignores_a_single_acoustic_outlier)
         originalTurn.value()[0].speakerId);
 }
 
-LS_TEST(acoustic_diarization_honors_tinydiarize_turns_without_embedding)
+LS_TEST(acoustic_diarization_ignores_false_turn_for_a_strong_voice_match)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    LS_CHECK(backend.value()->prepare(DiarizationConfiguration{}));
+
+    AudioWindow system;
+    system.sourceId = 2;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+
+    AsrHypothesis before;
+    before.stableId[15] = 1;
+    before.sourceId = 2;
+    before.startTimeNs = 1'000'000'000;
+    before.endTimeNs = 1'500'000'000;
+    before.final = true;
+    before.revision = 1;
+    before.speakerTurnAfter = true;
+    before.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    before.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+    auto first = backend.value()->assign(system, {&before, 1});
+    LS_CHECK(first);
+
+    AsrHypothesis after = before;
+    after.stableId[15] = 2;
+    after.startTimeNs = 1'600'000'000;
+    after.endTimeNs = 2'100'000'000;
+    after.speakerTurnAfter = false;
+    after.speakerEmbedding = speakerEmbeddingAtAngle(0.10F);
+    auto second = backend.value()->assign(system, {&after, 1});
+    LS_CHECK(second);
+    LS_CHECK_EQ(
+        first.value()[0].speakerId,
+        second.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_does_not_invent_a_speaker_without_embedding)
 {
     auto backend = createDiarizationBackend("acoustic-clustering");
     LS_CHECK(backend);
@@ -518,6 +554,43 @@ LS_TEST(acoustic_diarization_honors_tinydiarize_turns_without_embedding)
     AsrHypothesis after = before;
     after.stableId[15] = 2;
     after.speakerTurnAfter = false;
+    auto second = backend.value()->assign(system, {&after, 1});
+    LS_CHECK(second);
+    LS_CHECK_EQ(
+        first.value()[0].speakerId,
+        second.value()[0].speakerId);
+}
+
+LS_TEST(acoustic_diarization_keeps_a_real_explicit_voice_change)
+{
+    auto backend = createDiarizationBackend("acoustic-clustering");
+    LS_CHECK(backend);
+    LS_CHECK(backend.value()->prepare(DiarizationConfiguration{}));
+
+    AudioWindow system;
+    system.sourceId = 2;
+    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+
+    AsrHypothesis before;
+    before.stableId[15] = 1;
+    before.sourceId = 2;
+    before.startTimeNs = 1'000'000'000;
+    before.endTimeNs = 1'500'000'000;
+    before.final = true;
+    before.revision = 1;
+    before.speakerTurnAfter = true;
+    before.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
+    before.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
+    auto first = backend.value()->assign(system, {&before, 1});
+    LS_CHECK(first);
+
+    AsrHypothesis after = before;
+    after.stableId[15] = 2;
+    after.startTimeNs = 1'600'000'000;
+    after.endTimeNs = 2'100'000'000;
+    after.speakerTurnAfter = false;
+    after.speakerEmbedding = speakerEmbeddingAtAngle(
+        std::numbers::pi_v<float> / 2.0F);
     auto second = backend.value()->assign(system, {&after, 1});
     LS_CHECK(second);
     LS_CHECK(

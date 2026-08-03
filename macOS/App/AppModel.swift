@@ -442,6 +442,15 @@ final class AppModel: ObservableObject {
         voiceProfileFailure = nil
     }
 
+    func retryLastPublication() {
+        guard let controller else {
+            return
+        }
+        Task {
+            try? await controller.retryLastPublication()
+        }
+    }
+
     func quit() {
         NSApplication.shared.terminate(nil)
     }
