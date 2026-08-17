@@ -285,5 +285,8 @@ macOS, модель Mac (`Apple menu → About This Mac`) и вывод `swift -
 
 Архитектура и границы компонентов описаны в
 [Docs/Architecture/Project-Structure.md](Architecture/Project-Structure.md).
-Основная команда проверки — `Scripts/verify-mvp.sh`. Отдельные проверки и
+Основная команда проверки — `Scripts/verify-mvp.sh`. Все сценарии сборки,
+тестирования, soak-проверок и упаковки также доступны через корневой `Makefile`;
+их параметры и примеры собраны в
+[инструкции по командам разработки](Development.ru.md). Отдельные проверки и
 двухчасовой soak-тест перечислены в корневом [README](../README.md).

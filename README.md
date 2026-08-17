@@ -111,6 +111,9 @@ For a step-by-step guide covering prerequisites, model selection, macOS
 permissions, updates, removal, and troubleshooting, see
 [Installation (Russian)](Docs/Installation.ru.md).
 
+For Make commands covering every build, test, soak, ASR, and packaging script,
+see [Development commands (Russian)](Docs/Development.ru.md).
+
 ## Verification
 
 Run the complete local gate:
