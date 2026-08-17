@@ -103,6 +103,14 @@ struct MenuBarContentView: View {
                 )
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
+                if model.detectedCallProposal != nil {
+                    Text(
+                        "If this call later appears to have ended, LocalScribe will show a countdown before stopping automatically."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
 
                 HStack {
                     Text("Meeting language")
@@ -134,7 +142,9 @@ struct MenuBarContentView: View {
                     .disabled(!model.canStartRecording)
                     .keyboardShortcut(.defaultAction)
                     .accessibilityHint(
-                        "Explicitly consents to microphone and system audio capture"
+                        model.detectedCallProposal == nil
+                            ? "Explicitly consents to microphone and system audio capture"
+                            : "Explicitly consents to capture; a confirmed call end will show a warning before stopping"
                     )
                 }
                 if !model.canStartRecording {
@@ -157,6 +167,7 @@ struct MenuBarContentView: View {
         case .recording:
             sourceRows
             speakerProfiles
+            autoStopWarning
             if let metrics = model.session.metrics {
                 Text(
                     "Processing queue: \(metrics.audioQueueDepth) / high \(metrics.audioQueueHighWater)"
@@ -181,6 +192,7 @@ struct MenuBarContentView: View {
         case .paused:
             sourceRows
             speakerProfiles
+            autoStopWarning
             Text("Capture is paused. Already accepted audio is still journaled.")
                 .font(.callout)
             HStack {
@@ -212,6 +224,58 @@ struct MenuBarContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var autoStopWarning: some View {
+        if let prompt = model.detectedCallAutoStopPrompt {
+            VStack(alignment: .leading, spacing: 8) {
+                Label(
+                    "Call appears to have ended",
+                    systemImage: "phone.down.fill"
+                )
+                .font(.headline)
+                .foregroundStyle(.orange)
+
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text(
+                        "Stopping recording in "
+                            + "\(prompt.remainingSeconds()) seconds."
+                    )
+                    .font(.callout)
+                    .accessibilityLabel(
+                        "Stopping recording in "
+                            + "\(prompt.remainingSeconds()) seconds"
+                    )
+                }
+
+                HStack {
+                    Button("Keep Recording") {
+                        model.keepRecordingAfterCallEndWarning(
+                            promptID: prompt.id
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityHint(
+                        "Cancels this countdown and keeps capture running"
+                    )
+                    Spacer()
+                    Button("Stop Now", role: .destructive) {
+                        model.stopNowAfterCallEndWarning(
+                            promptID: prompt.id
+                        )
+                    }
+                    .accessibilityHint(
+                        "Stops capture and finalizes the transcript now"
+                    )
+                }
+            }
+            .padding(10)
+            .background(.orange.opacity(0.10), in: RoundedRectangle(
+                cornerRadius: 10,
+                style: .continuous
+            ))
         }
     }
 
@@ -456,7 +520,10 @@ struct MenuBarContentView: View {
     }
 
     private var statusText: String {
-        switch model.session.state {
+        if model.detectedCallAutoStopPrompt != nil {
+            return "Call appears to have ended"
+        }
+        return switch model.session.state {
         case .idle:
             "Ready — no capture"
         case .detected:

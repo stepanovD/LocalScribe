@@ -29,8 +29,8 @@ stateDiagram-v2
 
     recording --> paused: explicit Pause
     paused --> recording: explicit Resume
-    recording --> finalizing: explicit Stop
-    paused --> finalizing: explicit Stop
+    recording --> finalizing: explicit Stop / confirmed provider absence
+    paused --> finalizing: explicit Stop / confirmed provider absence
 
     recording --> recovery_required: process crash
     paused --> recovery_required: process crash
@@ -90,8 +90,24 @@ detector event.
 
 The detector is started only after startup recovery has completed successfully.
 If a call ends while its proposal is still pending, the proposal returns to
-`idle`. Once visible Start has been accepted, later detector events have no
-authority over `preparing`, `recording`, or finalization and never stop capture.
+`idle`. Once visible Start has been accepted, its UUID becomes the active
+session authority. Presence remains a provider/platform-level observation:
+another surface from the same platform counts as recovery, while evidence from
+other platforms is ignored. Only the reducer associated with the active UUID
+may request auto-stop; stale proposals and manual-start sessions are ignored.
+
+Auto-stop has a separate conservative reducer: ten consecutive known negative
+one-second samples show a ten-second warning. During `recording` capture
+continues and during `paused` it stays paused. If the deadline matures during
+`preparing`, the request waits behind the lifecycle lock and can finalize only
+after startup reaches `recording`; a failed start discards it. Unknown samples
+freeze confirmation and an overdue countdown rather than stopping.
+**Keep Recording**, closing the warning, or Escape snoozes it for five minutes;
+known recovery re-arms immediately, and continued absence after snooze shows a
+fresh countdown. A completed countdown or **Stop Now** follows the serialized
+Stop path but persists `call_ended` instead of `user_stop`. The association is
+ephemeral and clears on failed start, terminal completion, interruption,
+recovery, and Quit.
 
 ## Transition transaction rules
 
@@ -229,6 +245,8 @@ Examples rejected without side effects:
 - `awaiting_consent → recording` without preflight/journal creation;
 - any terminal state → `recording`;
 - `paused → recording` from a detection signal;
+- auto-stopping a manual session or a detected session with a stale/wrong
+  episode UUID;
 - `recording → complete` without finalization;
 - finalization while a capture callback can still enqueue frames;
 - writing `complete` when a required source is classified incomplete;

@@ -518,6 +518,182 @@ LS_TEST(c_abi_state_snapshot_is_authoritative_and_does_not_consume_events)
     LS_CHECK_EQ(terminal.phase, LS_PHASE_COMPLETE);
 }
 
+LS_TEST(c_abi_call_ended_finalizes_complete_and_persists_reason)
+{
+    const std::string sessionId{"call-ended-finalize"};
+    auto handles = createFixtureSession(sessionId);
+    LS_CHECK_EQ(
+        ls_session_mark_sources_ready_v1(handles.session),
+        LS_OK);
+    LS_CHECK_EQ(
+        ls_session_finalize_v1(
+            handles.session,
+            LS_FINALIZE_REASON_CALL_ENDED),
+        LS_OK);
+
+    ls_state_event_copy_v1 state{};
+    state.struct_size = sizeof(state);
+    state.abi_version = LS_CORE_ABI_VERSION;
+    LS_CHECK_EQ(
+        ls_session_copy_state_v1(handles.session, &state),
+        LS_OK);
+    LS_CHECK_EQ(state.phase, LS_PHASE_COMPLETE);
+    LS_CHECK_EQ(
+        state.published_status,
+        LS_PUBLISHED_STATUS_COMPLETE);
+    LS_CHECK_EQ(
+        state.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+
+    LS_CHECK_EQ(
+        ls_session_finalize_v1(
+            handles.session,
+            LS_FINALIZE_REASON_USER_STOP),
+        LS_OK);
+    state = {};
+    state.struct_size = sizeof(state);
+    state.abi_version = LS_CORE_ABI_VERSION;
+    LS_CHECK_EQ(
+        ls_session_copy_state_v1(handles.session, &state),
+        LS_OK);
+    LS_CHECK_EQ(state.phase, LS_PHASE_COMPLETE);
+    LS_CHECK_EQ(
+        state.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+
+    ls_state_event_copy_v1 terminal{};
+    LS_CHECK(waitForTerminalEvent(handles.session, terminal));
+    LS_CHECK_EQ(terminal.phase, LS_PHASE_COMPLETE);
+    LS_CHECK_EQ(
+        terminal.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+
+    ls_session_destroy(handles.session);
+    handles.session = nullptr;
+    ls_core_destroy(handles.core);
+    handles.core = nullptr;
+
+    const std::string journalPath = handles.path.string();
+    ls_core_config_v1 coreConfig{};
+    coreConfig.struct_size = sizeof(coreConfig);
+    coreConfig.abi_version = LS_CORE_ABI_VERSION;
+    coreConfig.flags = LS_CORE_CONFIG_ALLOW_TEST_BACKENDS;
+    coreConfig.journal_path = view(journalPath);
+    ls_error_v1 error{};
+    error.struct_size = sizeof(error);
+    error.abi_version = LS_CORE_ABI_VERSION;
+    LS_CHECK_EQ(
+        ls_core_create_v1(&coreConfig, &handles.core, &error),
+        LS_OK);
+    LS_CHECK_EQ(
+        ls_core_open_recoverable_session_v1(
+            handles.core,
+            view(sessionId),
+            &handles.session),
+        LS_OK);
+
+    state = {};
+    state.struct_size = sizeof(state);
+    state.abi_version = LS_CORE_ABI_VERSION;
+    LS_CHECK_EQ(
+        ls_session_copy_state_v1(handles.session, &state),
+        LS_OK);
+    LS_CHECK_EQ(state.phase, LS_PHASE_COMPLETE);
+    LS_CHECK_EQ(
+        state.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+}
+
+LS_TEST(c_abi_call_ended_finalizes_paused_session_complete)
+{
+    auto handles = createFixtureSession("call-ended-paused");
+    LS_CHECK_EQ(
+        ls_session_mark_sources_ready_v1(handles.session),
+        LS_OK);
+    LS_CHECK_EQ(ls_session_pause_v1(handles.session), LS_OK);
+
+    ls_state_event_copy_v1 state{};
+    state.struct_size = sizeof(state);
+    state.abi_version = LS_CORE_ABI_VERSION;
+    LS_CHECK_EQ(
+        ls_session_copy_state_v1(handles.session, &state),
+        LS_OK);
+    LS_CHECK_EQ(state.phase, LS_PHASE_PAUSED);
+
+    LS_CHECK_EQ(
+        ls_session_finalize_v1(
+            handles.session,
+            LS_FINALIZE_REASON_CALL_ENDED),
+        LS_OK);
+    LS_CHECK_EQ(
+        ls_session_copy_state_v1(handles.session, &state),
+        LS_OK);
+    LS_CHECK_EQ(state.phase, LS_PHASE_COMPLETE);
+    LS_CHECK_EQ(
+        state.published_status,
+        LS_PUBLISHED_STATUS_COMPLETE);
+    LS_CHECK_EQ(
+        state.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+
+    ls_state_event_copy_v1 terminal{};
+    LS_CHECK(waitForTerminalEvent(handles.session, terminal));
+    LS_CHECK_EQ(terminal.phase, LS_PHASE_COMPLETE);
+    LS_CHECK_EQ(
+        terminal.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+}
+
+LS_TEST(c_abi_call_ended_keeps_required_source_loss_incomplete)
+{
+    auto handles = createFixtureSession("call-ended-incomplete");
+    LS_CHECK_EQ(
+        ls_session_mark_sources_ready_v1(handles.session),
+        LS_OK);
+
+    const std::string reason{"required source permanently lost"};
+    ls_source_event_v1 event{};
+    event.struct_size = sizeof(event);
+    event.abi_version = LS_CORE_ABI_VERSION;
+    event.source_id = 2;
+    event.source_kind = LS_SOURCE_KIND_SYSTEM_AUDIO;
+    event.event_kind = LS_SOURCE_EVENT_PERMANENTLY_LOST;
+    event.health = LS_SOURCE_HEALTH_PERMANENTLY_LOST;
+    event.flags = LS_SOURCE_EVENT_FLAG_TEST_INJECTED;
+    event.start_time_ns = 1;
+    event.end_time_ns = 1;
+    event.reason = view(reason);
+    LS_CHECK_EQ(
+        ls_session_source_event_v1(handles.session, &event),
+        LS_OK);
+
+    LS_CHECK_EQ(
+        ls_session_finalize_v1(
+            handles.session,
+            LS_FINALIZE_REASON_CALL_ENDED),
+        LS_OK);
+    ls_state_event_copy_v1 state{};
+    state.struct_size = sizeof(state);
+    state.abi_version = LS_CORE_ABI_VERSION;
+    LS_CHECK_EQ(
+        ls_session_copy_state_v1(handles.session, &state),
+        LS_OK);
+    LS_CHECK_EQ(state.phase, LS_PHASE_INCOMPLETE_SOURCES);
+    LS_CHECK_EQ(
+        state.published_status,
+        LS_PUBLISHED_STATUS_INCOMPLETE_SOURCES);
+    LS_CHECK_EQ(
+        state.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+
+    ls_state_event_copy_v1 terminal{};
+    LS_CHECK(waitForTerminalEvent(handles.session, terminal));
+    LS_CHECK_EQ(terminal.phase, LS_PHASE_INCOMPLETE_SOURCES);
+    LS_CHECK_EQ(
+        terminal.finalize_reason,
+        LS_FINALIZE_REASON_CALL_ENDED);
+}
+
 LS_TEST(c_abi_fixture_runs_audio_to_journal_to_markdown)
 {
     auto handles = createFixtureSession("abi-vertical");

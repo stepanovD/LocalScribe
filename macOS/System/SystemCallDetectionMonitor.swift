@@ -256,9 +256,13 @@ struct SystemCallEnvironmentProvider: CallEnvironmentProviding {
 
 actor CallDetectionMonitor {
     nonisolated let events: AsyncStream<CallDetectionEvent>
+    nonisolated let presenceObservations:
+        AsyncStream<CallPresenceObservation>
 
     private let eventContinuation:
         AsyncStream<CallDetectionEvent>.Continuation
+    private let presenceContinuation:
+        AsyncStream<CallPresenceObservation>.Continuation
     private let provider: any CallEnvironmentProviding
     private let matcher: CallDetectionMatcher
     private let pollingInterval: Duration
@@ -276,8 +280,13 @@ actor CallDetectionMonitor {
         let pair = AsyncStream<CallDetectionEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(16)
         )
+        let presencePair = AsyncStream<CallPresenceObservation>.makeStream(
+            bufferingPolicy: .bufferingNewest(16)
+        )
         events = pair.stream
         eventContinuation = pair.continuation
+        presenceObservations = presencePair.stream
+        presenceContinuation = presencePair.continuation
         self.provider = provider
         self.matcher = matcher
         self.reducer = reducer
@@ -287,6 +296,7 @@ actor CallDetectionMonitor {
     deinit {
         pollingTask?.cancel()
         eventContinuation.finish()
+        presenceContinuation.finish()
     }
 
     func start() {
@@ -329,6 +339,13 @@ actor CallDetectionMonitor {
             return false
         }
         let evidence = matcher.evidence(in: snapshot)
+        let presenceObservation: CallPresenceObservation
+        if let evidence {
+            presenceObservation = .known(evidence.sustainingPlatforms)
+        } else {
+            presenceObservation = .unknown
+        }
+        presenceContinuation.yield(presenceObservation)
         let emittedEvents = reducer.reduceEvidence(evidence)
         for event in emittedEvents {
             eventContinuation.yield(event)

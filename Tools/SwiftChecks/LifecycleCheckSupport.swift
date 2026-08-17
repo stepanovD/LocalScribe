@@ -63,7 +63,7 @@ func runCaptureBarrierCheck() async throws {
         await systemAudio.suspendedStartAttempt == 1
     }) else {
         await systemAudio.releaseStart()
-        await startTask.value
+        _ = await startTask.value
         throw LifecycleCheckError.invariant(
             "initial Start did not suspend in the second capture adapter"
         )
@@ -81,14 +81,14 @@ func runCaptureBarrierCheck() async throws {
           session.pushAudioCount == 0
     else {
         await systemAudio.releaseStart()
-        await startTask.value
+        _ = await startTask.value
         throw LifecycleCheckError.invariant(
             "PREPARING audio crossed the capture barrier"
         )
     }
 
     await systemAudio.releaseStart()
-    await startTask.value
+    _ = await startTask.value
     guard await controller.currentSnapshot().state == .recording,
           session.markSourcesReadyCount == 1,
           session.pushAudioCount == 0
@@ -924,6 +924,191 @@ func runLifecycleResponsivenessCheck() async throws {
     else {
         throw LifecycleCheckError.invariant(
             "bounded Quit published terminal Markdown or lost durable finalization"
+        )
+    }
+}
+
+func runDetectedCallAutomaticStopCheck() async throws {
+    let pausedProposalID = UUID()
+    let pausedWriter = BlockingMarkdownPublisher()
+    await pausedWriter.release()
+    let pausedSession = LifecycleCheckSession(blocksFinalize: true)
+    let pausedController = SessionController(
+        coreClient: LifecycleCheckCore(session: pausedSession),
+        permissions: LifecycleCheckPermissions(),
+        directoryStore: LifecycleCheckVaultSelection(),
+        modelStore: LifecycleCheckModelSelection(),
+        vaultWriter: pausedWriter,
+        microphoneCapture: LifecycleCheckCapture(
+            sourceID: 1,
+            kind: .microphone
+        ),
+        systemAudioCapture: LifecycleCheckCapture(
+            sourceID: 2,
+            kind: .systemAudio
+        ),
+        journalURL: URL(
+            fileURLWithPath: "/private/tmp/detected-call-stop-check.sqlite3"
+        )
+    )
+
+    await pausedController.recoverInterruptedSessions()
+    guard await pausedController.proposeDetectedCall(id: pausedProposalID)
+    else {
+        throw LifecycleCheckError.invariant(
+            "detected-call proposal was not accepted"
+        )
+    }
+    let pausedToken = await MainActor.run {
+        VisibleConsentIssuer().issue(for: .start)
+    }
+    let pausedStarted = await pausedController.start(
+        after: pausedToken,
+        request: SessionStartRequest(
+            sourceApplication: "Detected call stop check",
+            title: "Detected call stop check",
+            preferredFilenameStem: "Detected call stop check",
+            localSpeakerName: "Me",
+            languageMode: .russianEnglish
+        ),
+        expectedDetectedProposalID: pausedProposalID
+    )
+    guard pausedStarted,
+          await pausedController.currentSnapshot().state == .recording
+    else {
+        throw LifecycleCheckError.invariant(
+            "detected-call Start did not report RECORDING"
+        )
+    }
+
+    await pausedController.stopDetectedCall(
+        expectedProposalID: UUID()
+    )
+    guard await pausedController.currentSnapshot().state == .recording,
+          pausedSession.finalizeCount == 0
+    else {
+        throw LifecycleCheckError.invariant(
+            "a mismatched call episode stopped the active recording"
+        )
+    }
+
+    await pausedController.pause()
+    guard await pausedController.currentSnapshot().state == .paused else {
+        throw LifecycleCheckError.invariant(
+            "detected-call check did not enter PAUSED"
+        )
+    }
+
+    let automaticStop = Task {
+        await pausedController.stopDetectedCall(
+            expectedProposalID: pausedProposalID
+        )
+    }
+    guard await eventually(timeout: .seconds(1), {
+        pausedSession.hasEnteredFinalize
+    }) else {
+        pausedSession.releaseFinalize()
+        await automaticStop.value
+        throw LifecycleCheckError.invariant(
+            "matching call end did not enter native finalization"
+        )
+    }
+    let concurrentManualStop = Task {
+        await pausedController.stop()
+    }
+    pausedSession.releaseFinalize()
+    await automaticStop.value
+    await concurrentManualStop.value
+
+    let pausedTerminal = pausedSession.currentState()
+    guard pausedTerminal.phase == .complete,
+          pausedTerminal.finalizeReason == .callEnded,
+          pausedSession.finalizeCount == 1,
+          await pausedController.currentSnapshot().state == .complete
+    else {
+        throw LifecycleCheckError.invariant(
+            "call end and concurrent manual Stop did not finalize exactly once"
+        )
+    }
+
+    let preparingProposalID = UUID()
+    let preparingWriter = BlockingMarkdownPublisher()
+    await preparingWriter.release()
+    let preparingSession = LifecycleCheckSession()
+    let preparingCore = BlockingCreateCore(session: preparingSession)
+    let preparingController = SessionController(
+        coreClient: preparingCore,
+        permissions: LifecycleCheckPermissions(),
+        directoryStore: LifecycleCheckVaultSelection(),
+        modelStore: LifecycleCheckModelSelection(),
+        vaultWriter: preparingWriter,
+        microphoneCapture: LifecycleCheckCapture(
+            sourceID: 1,
+            kind: .microphone
+        ),
+        systemAudioCapture: LifecycleCheckCapture(
+            sourceID: 2,
+            kind: .systemAudio
+        ),
+        journalURL: URL(
+            fileURLWithPath:
+                "/private/tmp/detected-call-preparing-stop-check.sqlite3"
+        )
+    )
+
+    await preparingController.recoverInterruptedSessions()
+    guard await preparingController.proposeDetectedCall(
+        id: preparingProposalID
+    ) else {
+        throw LifecycleCheckError.invariant(
+            "preparing detected-call proposal was not accepted"
+        )
+    }
+    let preparingToken = await MainActor.run {
+        VisibleConsentIssuer().issue(for: .start)
+    }
+    let preparingStart = Task {
+        await preparingController.start(
+            after: preparingToken,
+            request: SessionStartRequest(
+                sourceApplication: "Preparing detected call check",
+                title: "Preparing detected call check",
+                preferredFilenameStem: "Preparing detected call check",
+                localSpeakerName: "Me",
+                languageMode: .russianEnglish
+            ),
+            expectedDetectedProposalID: preparingProposalID
+        )
+    }
+    guard await eventually(timeout: .seconds(1), {
+        preparingCore.hasEnteredCreate
+    }), await preparingController.currentSnapshot().state == .preparing
+    else {
+        preparingCore.releaseCreate()
+        _ = await preparingStart.value
+        throw LifecycleCheckError.invariant(
+            "detected-call Start did not suspend in PREPARING"
+        )
+    }
+
+    let releasePreparing = Task {
+        try? await Task.sleep(for: .milliseconds(50))
+        preparingCore.releaseCreate()
+    }
+    await preparingController.stopDetectedCall(
+        expectedProposalID: preparingProposalID
+    )
+    await releasePreparing.value
+    let didReachRecording = await preparingStart.value
+    let preparingTerminal = preparingSession.currentState()
+    guard didReachRecording,
+          preparingTerminal.phase == .complete,
+          preparingTerminal.finalizeReason == .callEnded,
+          preparingSession.finalizeCount == 1,
+          await preparingController.currentSnapshot().state == .complete
+    else {
+        throw LifecycleCheckError.invariant(
+            "call end requested during PREPARING was lost"
         )
     }
 }
@@ -2737,6 +2922,7 @@ private final class LifecycleCheckSession:
     private var isClosed = false
     private var phase: CorePhase = .preparing
     private var finalizeReason: CoreFinalizeReason = .unknown
+    private var finalizeCalls = 0
     private let blocksFinalize: Bool
     private let blocksRenderAfterCount: Int?
     private let blocksMetricsAfterCount: Int?
@@ -2795,6 +2981,12 @@ private final class LifecycleCheckSession:
         condition.lock()
         defer { condition.unlock() }
         return terminalDrainPolls
+    }
+
+    var finalizeCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return finalizeCalls
     }
 
     func enqueueFinalSegment(_ segment: CoreTranscriptSegment) {
@@ -2884,8 +3076,17 @@ private final class LifecycleCheckSession:
         .accepted
     }
 
-    func pause() {}
-    func resumeAfterConsent() {}
+    func pause() {
+        condition.lock()
+        phase = .paused
+        condition.unlock()
+    }
+
+    func resumeAfterConsent() {
+        condition.lock()
+        phase = .recording
+        condition.unlock()
+    }
 
     func sourceEvent(
         sourceID: UInt64,
@@ -2899,6 +3100,7 @@ private final class LifecycleCheckSession:
 
     func finalize(reason: CoreFinalizeReason) {
         condition.lock()
+        finalizeCalls += 1
         if blocksFinalize {
             finalizeWasEntered = true
             condition.broadcast()

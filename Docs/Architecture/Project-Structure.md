@@ -217,7 +217,10 @@ backend-neutral and has no Apple dependency.
 - debounces call beginnings and endings into identity-scoped episodes;
 - treats an unavailable system snapshot as unknown, never as evidence that a
   call ended;
-- can only request the session actor to expose visible consent UI.
+- applies a conservative provider-level absence/countdown/snooze reducer only
+  to the session associated with the exact proposal UUID accepted by the user;
+- can request finalization only after a visible countdown; it never starts
+  capture and cannot stop a manual or differently identified session.
 
 ### `Tools`
 
@@ -268,6 +271,6 @@ test executable must compile, link, and pass without any macOS framework.
 | Security-scoped bookmarks | Swift tests and signed-app manual test |
 | External-edit conflict | Swift storage tests |
 | Capture timestamps/formats | adapter contract tests |
-| Zoom/Telemost/Google Meet/Skype matching and episode debounce | Swift tests/checks + signed-app manual matrix |
+| Zoom/Telemost/Google Meet/Skype matching, debounce, and proposal-bound provider auto-stop | Swift tests/checks + signed-app manual matrix |
 | TCC/device changes | signed-app manual matrix |
 | Two-hour durability | `LocalScribeSoak` + signed-app run |

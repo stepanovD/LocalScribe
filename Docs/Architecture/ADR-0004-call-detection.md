@@ -17,7 +17,7 @@ so detection must remain best effort and manual start must remain available.
 
 ## Decision
 
-The macOS shell owns a metadata-only detector with three layers:
+The macOS shell owns a metadata-only detector with four layers:
 
 1. A system adapter snapshots Core Audio process activity and visible Window
    Server metadata. It never creates an audio tap and never asks for a TCC
@@ -28,6 +28,10 @@ The macOS shell owns a metadata-only detector with three layers:
 3. A pure episode reducer requires two consecutive positive samples, tolerates
    two missing samples, and ends an episode on the third. It emits at most one
    proposal per provider per episode, including after **Not Now**.
+4. A separate pure auto-stop reducer observes the sustaining presence of the
+   exact provider whose proposal the user accepted. Ten consecutive known
+   negative one-second samples open a visible ten-second countdown; unknown
+   samples freeze the policy and can never request a stop.
 
 The adapter immediately reduces process/window metadata to `Sendable` values.
 Raw window titles do not cross the matcher boundary, enter a proposal, reach
@@ -53,8 +57,23 @@ The proposal is a single nonmodal floating `NSPanel`, because a `MenuBarExtra`
 cannot be opened reliably by program logic. The panel has **Start Recording**
 and **Not Now**, joins the current Space, does not bind Return as a default
 action, and mirrors the same consent state in the menu. Closing the panel is
-equivalent to **Not Now**. A detected end closes only its still-pending panel;
-it never stops a recording that the user already started.
+equivalent to **Not Now**. A detected end closes its still-pending panel. Once
+visible Start is accepted, the shell arms monitoring for that proposal and the
+controller transfers its UUID from the pending proposal to the start/session
+association after validating the consent token. A stop request that matures
+during `preparing` waits for startup to finish: a successful start is finalized
+through the normal recording path, while a failed start clears the association
+and request. Stale, simultaneous, and manual-start proposals have no authority
+over that session.
+
+When the active detected call remains absent through the countdown, the shell
+requests finalization with `call_ended`. The countdown is mirrored in the menu
+and a nonmodal panel with **Keep Recording** and **Stop Now**. Closing it or
+pressing Escape is equivalent to **Keep Recording**: capture continues and the
+warning is snoozed for five minutes. A known positive sample re-arms monitoring
+immediately. Continued absence after snooze shows a fresh countdown; it never
+causes a silent deferred stop. Manual Stop remains available throughout, and
+manual-start sessions are never stopped by detection.
 
 ## Recognition rules
 
@@ -98,25 +117,33 @@ Telemost, Google Meet, then Skype.
   not a reason to broaden browser microphone activity into a call signal.
 - Chromium-family helpers do not expose a public tab identity. A visible
   supported meeting title plus unrelated microphone use in another tab of the
-  same browser profile can therefore still produce a proposal. Hidden
-  matching windows may sustain an existing episode but cannot begin one. This
-  residual ambiguity can also keep a dismissed browser episode latched while
-  that hidden window and unrelated same-family input both remain. It is accepted
-  because the result is consent UI only; it never starts capture, and the
-  native detectors plus manual start remain available.
+  same browser profile can therefore still produce a proposal. Once a detected
+  recording is active, a matching title may sustain provider presence without
+  microphone activity, including while the window is hidden; title evidence
+  alone still cannot begin a new episode. This conservative rule avoids
+  stopping on mute or an audio-route change, but a stale meeting surface can
+  delay auto-stop. Start remains consent UI only. Stop uses the stronger
+  negative confirmation plus a visible warning so the user can keep capture
+  running; detection never starts capture, and manual start/Stop remain
+  available.
 - Client bundle IDs and meeting-title signatures are integration contracts and
   require signed-app acceptance checks when a provider or macOS changes.
-- Detection failures have no capture side effects; manual start remains the
-  deterministic fallback.
+- Detection failures are unknown observations and cannot advance or expire an
+  auto-stop countdown; manual start and Stop remain deterministic fallbacks.
 
 ## Verification
 
 Deterministic tests cover signature matching, cross-browser evidence isolation,
 onset debounce, end grace, deduplication, and new episodes after a confirmed
-end. Controller checks preserve the stronger invariant: a proposal alone makes
-zero permission, core-session, capture, or publication calls.
+end. Auto-stop tests cover negative confirmation, unknown-sample freezing,
+recovery, countdown, snooze/re-warning, provider isolation, exact proposal UUID
+authority, manual-session immunity, and Stop/end/Quit races. Controller checks
+preserve the stronger invariant: a proposal alone makes zero permission,
+core-session, capture, or publication calls.
 
 Signed-app acceptance should additionally exercise native and browser calls,
 the Meet PWA, installed legacy Skype and Skype for Business, muted joins,
 full-screen/minimized windows, **Not Now**, a second call after a completed
-transcript, and first-run behavior before Screen Recording access.
+transcript, first-run behavior before Screen Recording access, mute and route
+changes through the full auto-stop window, **Keep Recording**, **Stop Now**,
+Escape/close, paused capture, and simultaneous providers.

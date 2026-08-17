@@ -379,6 +379,31 @@ final class CallDetectionMatcherTests: XCTestCase {
         )
     }
 
+    func testRecognizedBrowserTitleSustainsWithoutInputButCannotBegin() {
+        let chrome = process(505, "com.google.Chrome")
+        let snapshot = CallEnvironmentSnapshot(
+            runningApplications: [chrome],
+            audioInputProcesses: [],
+            windows: [
+                window(
+                    ownerPID: chrome.processIdentifier,
+                    ownerBundleID: chrome.bundleIdentifier,
+                    title: "Meet - abc-defg-hij"
+                ),
+            ]
+        )
+
+        let evidence = matcher.evidence(in: snapshot)
+        XCTAssertEqual(
+            evidence?.beginningPlatforms,
+            Set<CallPlatform>()
+        )
+        XCTAssertEqual(
+            evidence?.sustainingPlatforms,
+            Set([.googleMeet])
+        )
+    }
+
     func testUnavailableSnapshotRemainsUnknown() {
         XCTAssertNil(matcher.matchingPlatforms(in: nil))
     }
@@ -404,6 +429,252 @@ final class CallDetectionMatcherTests: XCTestCase {
             ownerBundleIdentifier: ownerBundleID,
             title: title,
             isOnScreen: isOnScreen
+        )
+    }
+}
+
+final class DetectedCallAutoStopReducerTests: XCTestCase {
+    func testDefaultThresholdStartsCountdownAndDueTickRequestsStop() {
+        let now = ContinuousClock().now
+        var reducer = DetectedCallAutoStopReducer(platform: .zoom)
+
+        for sampleCount in 1..<10 {
+            XCTAssertEqual(
+                reducer.observe(.known([]), now: now),
+                []
+            )
+            XCTAssertEqual(
+                reducer.state,
+                .confirming(negativeSampleCount: sampleCount)
+            )
+        }
+
+        let deadline = now.advanced(by: .seconds(10))
+        XCTAssertEqual(
+            reducer.observe(.known([]), now: now),
+            [.countdownStarted(deadline: deadline)]
+        )
+        XCTAssertEqual(reducer.state, .countdown(deadline: deadline))
+        XCTAssertEqual(
+            reducer.tick(now: now.advanced(by: .seconds(9))),
+            []
+        )
+        XCTAssertEqual(
+            reducer.tick(now: deadline),
+            [.stopRequested]
+        )
+        XCTAssertEqual(reducer.state, .stopRequested)
+        XCTAssertEqual(
+            reducer.tick(now: deadline.advanced(by: .seconds(1))),
+            []
+        )
+    }
+
+    func testUnknownSamplesFreezeConfirmationCount() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 3)
+
+        XCTAssertEqual(reducer.observe(.known([]), now: now), [])
+        XCTAssertEqual(
+            reducer.state,
+            .confirming(negativeSampleCount: 1)
+        )
+        XCTAssertEqual(reducer.observe(.unknown, now: now), [])
+        XCTAssertEqual(reducer.observe(.unknown, now: now), [])
+        XCTAssertEqual(
+            reducer.state,
+            .confirming(negativeSampleCount: 1)
+        )
+        XCTAssertEqual(reducer.observe(.known([]), now: now), [])
+        XCTAssertEqual(
+            reducer.state,
+            .confirming(negativeSampleCount: 2)
+        )
+    }
+
+    func testOnlyTargetPlatformRearmsMonitoring() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 3)
+
+        XCTAssertEqual(
+            reducer.observe(.known([.googleMeet]), now: now),
+            []
+        )
+        XCTAssertEqual(
+            reducer.state,
+            .confirming(negativeSampleCount: 1)
+        )
+        XCTAssertEqual(
+            reducer.observe(.known([.zoom, .googleMeet]), now: now),
+            [.monitoringResumed]
+        )
+        XCTAssertEqual(reducer.state, .monitoring)
+    }
+
+    func testTargetRecoveryCancelsCountdownAndRearmsFullThreshold() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 2)
+
+        XCTAssertEqual(reducer.observe(.known([]), now: now), [])
+        let firstDeadline = now.advanced(by: .seconds(10))
+        XCTAssertEqual(
+            reducer.observe(.known([]), now: now),
+            [.countdownStarted(deadline: firstDeadline)]
+        )
+        XCTAssertEqual(
+            reducer.observe(.known([.zoom]), now: now),
+            [.monitoringResumed]
+        )
+        XCTAssertEqual(reducer.state, .monitoring)
+
+        XCTAssertEqual(reducer.observe(.known([]), now: now), [])
+        XCTAssertEqual(
+            reducer.state,
+            .confirming(negativeSampleCount: 1)
+        )
+    }
+
+    func testUnknownAtCountdownDeadlineBlocksStopAndRestartsWarning() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 1)
+        let firstDeadline = now.advanced(by: .seconds(10))
+
+        XCTAssertEqual(
+            reducer.observe(.known([]), now: now),
+            [.countdownStarted(deadline: firstDeadline)]
+        )
+        XCTAssertEqual(
+            reducer.observe(
+                .unknown,
+                now: now.advanced(by: .seconds(5))
+            ),
+            []
+        )
+        XCTAssertEqual(reducer.tick(now: firstDeadline), [])
+        XCTAssertEqual(
+            reducer.tick(now: now.advanced(by: .seconds(30))),
+            []
+        )
+
+        let recoveredAt = now.advanced(by: .seconds(30))
+        let restartedDeadline = recoveredAt.advanced(by: .seconds(10))
+        XCTAssertEqual(
+            reducer.observe(.known([]), now: recoveredAt),
+            [.countdownStarted(deadline: restartedDeadline)]
+        )
+        XCTAssertEqual(
+            reducer.state,
+            .countdown(deadline: restartedDeadline)
+        )
+        XCTAssertEqual(
+            reducer.tick(now: restartedDeadline),
+            [.stopRequested]
+        )
+    }
+
+    func testKeepRecordingSnoozesThenRetriggersCountdown() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 1)
+        let initialDeadline = now.advanced(by: .seconds(10))
+        _ = reducer.observe(.known([]), now: now)
+
+        let keptAt = now.advanced(by: .seconds(2))
+        let snoozeDeadline = keptAt.advanced(by: .seconds(300))
+        XCTAssertEqual(
+            reducer.keepRecording(now: keptAt),
+            [.snoozed(deadline: snoozeDeadline)]
+        )
+        XCTAssertEqual(reducer.state, .snoozed(deadline: snoozeDeadline))
+        XCTAssertNotEqual(reducer.state, .countdown(deadline: initialDeadline))
+        XCTAssertEqual(
+            reducer.tick(
+                now: snoozeDeadline.advanced(by: .milliseconds(-1))
+            ),
+            []
+        )
+
+        let retriggeredDeadline = snoozeDeadline.advanced(by: .seconds(10))
+        XCTAssertEqual(
+            reducer.tick(now: snoozeDeadline),
+            [.countdownStarted(deadline: retriggeredDeadline)]
+        )
+        XCTAssertEqual(
+            reducer.state,
+            .countdown(deadline: retriggeredDeadline)
+        )
+    }
+
+    func testUnknownAtSnoozeDeadlineWaitsForKnownAbsence() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 1)
+        _ = reducer.observe(.known([]), now: now)
+        let snoozeDeadline = now.advanced(by: .seconds(300))
+        _ = reducer.keepRecording(now: now)
+
+        XCTAssertEqual(
+            reducer.observe(
+                .unknown,
+                now: snoozeDeadline.advanced(by: .seconds(-1))
+            ),
+            []
+        )
+        XCTAssertEqual(reducer.tick(now: snoozeDeadline), [])
+
+        let knownAt = snoozeDeadline.advanced(by: .seconds(20))
+        let countdownDeadline = knownAt.advanced(by: .seconds(10))
+        XCTAssertEqual(
+            reducer.observe(.known([]), now: knownAt),
+            [.countdownStarted(deadline: countdownDeadline)]
+        )
+        XCTAssertEqual(
+            reducer.state,
+            .countdown(deadline: countdownDeadline)
+        )
+    }
+
+    func testTargetRecoveryDuringSnoozeCancelsAndRearms() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 1)
+        _ = reducer.observe(.known([]), now: now)
+        _ = reducer.keepRecording(now: now)
+
+        XCTAssertEqual(
+            reducer.observe(.known([.zoom]), now: now),
+            [.monitoringResumed]
+        )
+        XCTAssertEqual(reducer.state, .monitoring)
+
+        let deadline = now.advanced(by: .seconds(10))
+        XCTAssertEqual(
+            reducer.observe(.known([]), now: now),
+            [.countdownStarted(deadline: deadline)]
+        )
+    }
+
+    func testKeepRecordingOutsideCountdownHasNoEffect() {
+        let now = ContinuousClock().now
+        var reducer = makeReducer(requiredNegativeSamples: 2)
+
+        XCTAssertEqual(reducer.keepRecording(now: now), [])
+        XCTAssertEqual(reducer.state, .monitoring)
+        _ = reducer.observe(.known([]), now: now)
+        XCTAssertEqual(reducer.keepRecording(now: now), [])
+        XCTAssertEqual(
+            reducer.state,
+            .confirming(negativeSampleCount: 1)
+        )
+    }
+
+    private func makeReducer(
+        requiredNegativeSamples: Int
+    ) -> DetectedCallAutoStopReducer {
+        DetectedCallAutoStopReducer(
+            platform: .zoom,
+            configuration: .init(
+                requiredNegativeSamples: requiredNegativeSamples,
+                countdownDuration: .seconds(10),
+                snoozeDuration: .seconds(300)
+            )
         )
     }
 }
@@ -635,6 +906,46 @@ final class CallDetectionOfferLedgerTests: XCTestCase {
 }
 
 final class CallDetectionMonitorLifecycleTests: XCTestCase {
+    func testMonitorEmitsUnknownAndReducedKnownPresenceSamples() async {
+        let chrome = CallProcessObservation(
+            processIdentifier: 700,
+            bundleIdentifier: "com.google.Chrome"
+        )
+        let titleOnlyMeet = CallEnvironmentSnapshot(
+            runningApplications: [chrome],
+            audioInputProcesses: [],
+            windows: [
+                CallWindowObservation(
+                    ownerProcessIdentifier: chrome.processIdentifier,
+                    ownerBundleIdentifier: chrome.bundleIdentifier,
+                    title: "Meet - abc-defg-hij"
+                ),
+            ]
+        )
+        let provider = SequencedCallEnvironmentProvider(
+            snapshots: [nil, titleOnlyMeet]
+        )
+        let monitor = CallDetectionMonitor(
+            provider: provider,
+            pollingInterval: .milliseconds(10)
+        )
+        let observations = monitor.presenceObservations
+        let collection = Task { () -> [CallPresenceObservation] in
+            var iterator = observations.makeAsyncIterator()
+            var values: [CallPresenceObservation] = []
+            while values.count < 2, let value = await iterator.next() {
+                values.append(value)
+            }
+            return values
+        }
+
+        await monitor.start()
+        let values = await collection.value
+        await monitor.stop()
+
+        XCTAssertEqual(values, [.unknown, .known([.googleMeet])])
+    }
+
     func testMonitorCanDeallocateWithoutExplicitStop() async {
         weak var weakMonitor: CallDetectionMonitor?
 
@@ -653,6 +964,21 @@ final class CallDetectionMonitorLifecycleTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertNil(weakMonitor)
+    }
+}
+
+private actor SequencedCallEnvironmentProvider: CallEnvironmentProviding {
+    private var snapshots: [CallEnvironmentSnapshot?]
+
+    init(snapshots: [CallEnvironmentSnapshot?]) {
+        self.snapshots = snapshots
+    }
+
+    func snapshot() async -> CallEnvironmentSnapshot? {
+        guard !snapshots.isEmpty else {
+            return nil
+        }
+        return snapshots.removeFirst()
     }
 }
 

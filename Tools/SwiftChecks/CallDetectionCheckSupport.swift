@@ -202,6 +202,19 @@ func runCallDetectionCheck() async throws {
         "a landing, support, or background window was classified as a call"
     )
 
+    let titleOnlyMeetEvidence = matcher.evidence(
+        in: CallEnvironmentSnapshot(
+            runningApplications: [meetPWA],
+            audioInputProcesses: [],
+            windows: [meetWindow]
+        )
+    )
+    try requireCallDetection(
+        titleOnlyMeetEvidence?.beginningPlatforms.isEmpty == true
+            && titleOnlyMeetEvidence?.sustainingPlatforms == [.googleMeet],
+        "a recognized browser title did not sustain without beginning an episode"
+    )
+
     let safariInput = CallProcessObservation(
         processIdentifier: 40,
         bundleIdentifier: "com.apple.WebKit.WebContent"
@@ -315,6 +328,110 @@ func runCallDetectionCheck() async throws {
             && independentReducer.reduce([]).isEmpty
             && independentReducer.reduce([]) == [.ended(skypeProposal)],
         "the independent Skype episode did not end after its grace period"
+    )
+
+    let autoStopNow = ContinuousClock().now
+    var autoStop = DetectedCallAutoStopReducer(platform: .zoom)
+    for sampleCount in 1..<10 {
+        try requireCallDetection(
+            autoStop.observe(.known([]), now: autoStopNow).isEmpty
+                && autoStop.state
+                    == .confirming(negativeSampleCount: sampleCount),
+            "auto-stop did not require ten consecutive known-negative samples"
+        )
+    }
+    try requireCallDetection(
+        autoStop.observe(.unknown, now: autoStopNow).isEmpty
+            && autoStop.state == .confirming(negativeSampleCount: 9),
+        "an unknown presence sample advanced auto-stop confirmation"
+    )
+    let autoStopDeadline = autoStopNow.advanced(by: .seconds(10))
+    try requireCallDetection(
+        autoStop.observe(.known([]), now: autoStopNow)
+            == [.countdownStarted(deadline: autoStopDeadline)]
+            && autoStop.state == .countdown(deadline: autoStopDeadline),
+        "ten known-negative samples did not start the auto-stop countdown"
+    )
+    try requireCallDetection(
+        autoStop.tick(
+            now: autoStopNow.advanced(by: .seconds(9))
+        ).isEmpty
+            && autoStop.tick(now: autoStopDeadline) == [.stopRequested]
+            && autoStop.tick(
+                now: autoStopDeadline.advanced(by: .seconds(1))
+            ).isEmpty
+            && autoStop.state == .stopRequested,
+        "the auto-stop countdown did not request exactly one due stop"
+    )
+
+    let shortAutoStopConfiguration =
+        DetectedCallAutoStopReducer.Configuration(
+            requiredNegativeSamples: 1,
+            countdownDuration: .seconds(10),
+            snoozeDuration: .seconds(300)
+        )
+    var uncertainAutoStop = DetectedCallAutoStopReducer(
+        platform: .zoom,
+        configuration: shortAutoStopConfiguration
+    )
+    let uncertainDeadline = autoStopNow.advanced(by: .seconds(10))
+    try requireCallDetection(
+        uncertainAutoStop.observe(.known([]), now: autoStopNow)
+            == [.countdownStarted(deadline: uncertainDeadline)],
+        "the injected auto-stop threshold was ignored"
+    )
+    _ = uncertainAutoStop.observe(
+        .unknown,
+        now: autoStopNow.advanced(by: .seconds(5))
+    )
+    try requireCallDetection(
+        uncertainAutoStop.tick(now: uncertainDeadline).isEmpty,
+        "an unknown presence sample allowed a due auto-stop"
+    )
+    let knownAgainAt = autoStopNow.advanced(by: .seconds(20))
+    let restartedDeadline = knownAgainAt.advanced(by: .seconds(10))
+    try requireCallDetection(
+        uncertainAutoStop.observe(.known([]), now: knownAgainAt)
+            == [.countdownStarted(deadline: restartedDeadline)]
+            && uncertainAutoStop.state
+                == .countdown(deadline: restartedDeadline),
+        "known absence after uncertainty did not restart a full countdown"
+    )
+    try requireCallDetection(
+        uncertainAutoStop.observe(.known([.zoom]), now: knownAgainAt)
+            == [.monitoringResumed]
+            && uncertainAutoStop.state == .monitoring,
+        "same-platform recovery did not cancel and rearm auto-stop"
+    )
+
+    var snoozedAutoStop = DetectedCallAutoStopReducer(
+        platform: .zoom,
+        configuration: shortAutoStopConfiguration
+    )
+    _ = snoozedAutoStop.observe(.known([.googleMeet]), now: autoStopNow)
+    let snoozeDeadline = autoStopNow.advanced(by: .seconds(300))
+    try requireCallDetection(
+        snoozedAutoStop.keepRecording(now: autoStopNow)
+            == [.snoozed(deadline: snoozeDeadline)]
+            && snoozedAutoStop.state == .snoozed(deadline: snoozeDeadline),
+        "Keep Recording did not snooze auto-stop for five minutes"
+    )
+    _ = snoozedAutoStop.observe(
+        .unknown,
+        now: snoozeDeadline.advanced(by: .seconds(-1))
+    )
+    try requireCallDetection(
+        snoozedAutoStop.tick(now: snoozeDeadline).isEmpty,
+        "unknown presence ended the auto-stop snooze"
+    )
+    let snoozeKnownAt = snoozeDeadline.advanced(by: .seconds(20))
+    let snoozeRestartedDeadline = snoozeKnownAt.advanced(by: .seconds(10))
+    try requireCallDetection(
+        snoozedAutoStop.observe(.known([]), now: snoozeKnownAt)
+            == [.countdownStarted(deadline: snoozeRestartedDeadline)]
+            && snoozedAutoStop.state
+                == .countdown(deadline: snoozeRestartedDeadline),
+        "known absence after a frozen snooze did not retrigger the warning"
     )
 
     var offerLedger = CallDetectionOfferLedger()

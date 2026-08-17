@@ -212,6 +212,7 @@ actor SessionController {
     private var startupRecoveryInProgress = false
     private var terminationRequested = false
     private var pendingDetectedProposalID: UUID?
+    private var activeDetectedProposalID: UUID?
 
     init(
         coreClient: any CoreClientProtocol,
@@ -248,6 +249,7 @@ actor SessionController {
             throw SessionControllerError.invalidTransition
         }
         pendingDetectedProposalID = nil
+        activeDetectedProposalID = nil
         update(state: .awaitingConsent, failure: nil)
     }
 
@@ -261,6 +263,7 @@ actor SessionController {
             return false
         }
         pendingDetectedProposalID = id
+        activeDetectedProposalID = nil
         update(state: .detected, failure: nil)
         update(state: .awaitingConsent, failure: nil)
         return true
@@ -277,11 +280,12 @@ actor SessionController {
         update(state: .idle, failure: nil)
     }
 
+    @discardableResult
     func start(
         after token: ConsentToken,
         request: SessionStartRequest,
         expectedDetectedProposalID: UUID? = nil
-    ) async {
+    ) async -> Bool {
         await acquireLifecycleSlot()
         defer { releaseLifecycleSlot() }
 
@@ -290,7 +294,7 @@ actor SessionController {
               snapshot.state == .awaitingConsent,
               pendingDetectedProposalID == expectedDetectedProposalID
         else {
-            return
+            return false
         }
 
         pendingDetectedProposalID = nil
@@ -303,11 +307,13 @@ actor SessionController {
             } else {
                 failStart(.invalidTransition)
             }
-            return
+            return false
         } catch {
             failStart(.invalidTransition)
-            return
+            return false
         }
+
+        activeDetectedProposalID = expectedDetectedProposalID
 
         update(state: .preparing, failure: nil)
         let sessionID = UUID()
@@ -445,6 +451,7 @@ actor SessionController {
                 generation: generation,
                 delayNanoseconds: 0
             )
+            return true
         } catch let error as SessionControllerError {
             cleanupFailedStart()
             if case let .preflight(code) = error {
@@ -456,6 +463,7 @@ actor SessionController {
             cleanupFailedStart()
             failStart(.internalFailure)
         }
+        return false
     }
 
     func pause() async {
@@ -538,12 +546,46 @@ actor SessionController {
             return
         }
 
+        await finalizeActiveSession(session, reason: .userStop)
+    }
+
+    func stopDetectedCall(expectedProposalID: UUID) async {
+        await acquireLifecycleSlot()
+        defer { releaseLifecycleSlot() }
+
+        if pendingDetectedProposalID == expectedProposalID {
+            guard session == nil,
+                  (snapshot.state == .awaitingConsent
+                    || snapshot.state == .detected)
+            else {
+                return
+            }
+            pendingDetectedProposalID = nil
+            update(state: .idle, failure: nil)
+            return
+        }
+
+        guard activeDetectedProposalID == expectedProposalID,
+              snapshot.state == .recording || snapshot.state == .paused,
+              let session
+        else {
+            return
+        }
+
+        await finalizeActiveSession(session, reason: .callEnded)
+    }
+
+    private func finalizeActiveSession(
+        _ session: any CoreSessionProtocol,
+        reason: CoreFinalizeReason
+    ) async {
         let generation = activeGeneration
         cancelSourceRecoveryTasks()
         update(state: .finalizing, failure: nil)
         cancelPublicationWorker()
         terminalPublicationClaimed = true
         intentionalCaptureStop = true
+        defer { intentionalCaptureStop = false }
         frameRouter.detach()
         await stopCaptureAdaptersForTerminationBounded()
         do {
@@ -551,7 +593,7 @@ actor SessionController {
             let terminalState = try await Task.detached(
                 priority: .userInitiated
             ) {
-                try session.finalize(reason: .userStop)
+                try session.finalize(reason: reason)
                 return try session.currentState()
             }.value
             guard terminalState.phase.isTerminal else {
@@ -562,7 +604,6 @@ actor SessionController {
                 generation: generation
             )
             guard generation == activeGeneration else {
-                intentionalCaptureStop = false
                 return
             }
             applyCorePhase(terminalState.phase)
@@ -576,7 +617,6 @@ actor SessionController {
         } catch {
             await interruptActiveSession(code: .coreUnavailable)
         }
-        intentionalCaptureStop = false
     }
 
     /// Quiesces a partially-started capture without waiting for the lifecycle
@@ -585,6 +625,7 @@ actor SessionController {
     func prepareForTermination() async {
         terminationRequested = true
         pendingDetectedProposalID = nil
+        activeDetectedProposalID = nil
         cancelPublicationWorker()
         frameRouter.detach()
         intentionalCaptureStop = true
@@ -756,6 +797,8 @@ actor SessionController {
         else {
             return
         }
+        pendingDetectedProposalID = nil
+        activeDetectedProposalID = nil
         startupRecoveryInProgress = true
         startupRecoveryScanned = false
         defer {
@@ -2181,6 +2224,8 @@ actor SessionController {
         captureEventMailbox = nil
         frameRouter.detach()
         session = nil
+        pendingDetectedProposalID = nil
+        activeDetectedProposalID = nil
         modelLease = nil
         activeRequest = nil
         activeCreatedAt = nil
@@ -2250,6 +2295,8 @@ actor SessionController {
         captureEventMailbox = nil
         frameRouter.detach()
         session = nil
+        pendingDetectedProposalID = nil
+        activeDetectedProposalID = nil
         if let closingSession {
             Task.detached(priority: .utility) {
                 closingSession.close()
@@ -2276,6 +2323,8 @@ actor SessionController {
         frameRouter.detach()
         session?.close()
         session = nil
+        pendingDetectedProposalID = nil
+        activeDetectedProposalID = nil
         modelLease?.release()
         modelLease = nil
         activeRequest = nil
@@ -2320,6 +2369,7 @@ actor SessionController {
     }
 
     private func failStart(_ code: SessionFailureCode) {
+        activeDetectedProposalID = nil
         if let context = lastReviewContext,
            snapshot.sessionID == context.sessionID
         {

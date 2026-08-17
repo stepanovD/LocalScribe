@@ -65,9 +65,201 @@ enum CallDetectionEvent: Sendable, Equatable {
     case ended(DetectedCallProposal)
 }
 
+/// A privacy-preserving call-presence sample emitted alongside episode events.
+/// `known` contains only reduced platform identities; raw process and window
+/// metadata never crosses the matcher boundary. `unknown` means the system
+/// provider could not produce a trustworthy sample and must never be treated as
+/// evidence that a call ended.
+enum CallPresenceObservation: Sendable, Equatable {
+    case known(Set<CallPlatform>)
+    case unknown
+}
+
 struct CallDetectionEvidence: Sendable, Equatable {
     let beginningPlatforms: Set<CallPlatform>
     let sustainingPlatforms: Set<CallPlatform>
+}
+
+/// Turns conservative call-presence samples into an explicit auto-stop flow.
+///
+/// The reducer is intentionally independent of tasks and wall-clock reads. Its
+/// owner supplies a monotonic `now` value and is responsible for protecting
+/// timer callbacks with its own session/proposal generation. The target
+/// platform is fixed at initialization so activity from another provider can
+/// neither keep a recording alive nor cancel its pending stop.
+struct DetectedCallAutoStopReducer: Sendable {
+    struct Configuration: Sendable, Equatable {
+        let requiredNegativeSamples: Int
+        let countdownDuration: Duration
+        let snoozeDuration: Duration
+
+        init(
+            requiredNegativeSamples: Int = 10,
+            countdownDuration: Duration = .seconds(10),
+            snoozeDuration: Duration = .seconds(300)
+        ) {
+            precondition(requiredNegativeSamples > 0)
+            precondition(countdownDuration > .zero)
+            precondition(snoozeDuration > .zero)
+            self.requiredNegativeSamples = requiredNegativeSamples
+            self.countdownDuration = countdownDuration
+            self.snoozeDuration = snoozeDuration
+        }
+    }
+
+    enum State: Sendable, Equatable {
+        case monitoring
+        case confirming(negativeSampleCount: Int)
+        case countdown(deadline: ContinuousClock.Instant)
+        case snoozed(deadline: ContinuousClock.Instant)
+        case stopRequested
+    }
+
+    enum Effect: Sendable, Equatable {
+        case monitoringResumed
+        case countdownStarted(deadline: ContinuousClock.Instant)
+        case snoozed(deadline: ContinuousClock.Instant)
+        case stopRequested
+    }
+
+    private enum LatestPresence: Sendable, Equatable {
+        case present
+        case absent
+        case unknown
+    }
+
+    let platform: CallPlatform
+    private(set) var state: State = .monitoring
+
+    private let configuration: Configuration
+    private var latestPresence: LatestPresence = .unknown
+
+    init(
+        platform: CallPlatform,
+        configuration: Configuration = Configuration()
+    ) {
+        self.platform = platform
+        self.configuration = configuration
+    }
+
+    /// Reduces one poll result. Unknown observations freeze confirmation and
+    /// deadline state; they never count as absence and never request a stop.
+    mutating func observe(
+        _ observation: CallPresenceObservation,
+        now: ContinuousClock.Instant
+    ) -> [Effect] {
+        switch observation {
+        case let .known(platforms):
+            if platforms.contains(platform) {
+                latestPresence = .present
+                return observePresent()
+            }
+
+            let wasUnknown = latestPresence == .unknown
+            latestPresence = .absent
+            return observeAbsent(now: now, wasUnknown: wasUnknown)
+
+        case .unknown:
+            latestPresence = .unknown
+            return []
+        }
+    }
+
+    /// Advances an already-established countdown or snooze deadline. A due
+    /// deadline remains frozen while the latest observation is unknown.
+    mutating func tick(now: ContinuousClock.Instant) -> [Effect] {
+        switch state {
+        case let .countdown(deadline):
+            guard now >= deadline, latestPresence == .absent else {
+                return []
+            }
+            state = .stopRequested
+            return [.stopRequested]
+
+        case let .snoozed(deadline):
+            guard now >= deadline, latestPresence == .absent else {
+                return []
+            }
+            return startCountdown(now: now)
+
+        case .monitoring, .confirming, .stopRequested:
+            return []
+        }
+    }
+
+    /// Keeps the current recording alive for the configured snooze duration.
+    /// The action is accepted only while the warning countdown is active.
+    mutating func keepRecording(
+        now: ContinuousClock.Instant
+    ) -> [Effect] {
+        guard case .countdown = state else {
+            return []
+        }
+        let deadline = now.advanced(by: configuration.snoozeDuration)
+        state = .snoozed(deadline: deadline)
+        return [.snoozed(deadline: deadline)]
+    }
+
+    private mutating func observePresent() -> [Effect] {
+        switch state {
+        case .monitoring, .stopRequested:
+            return []
+        case .confirming, .countdown, .snoozed:
+            state = .monitoring
+            return [.monitoringResumed]
+        }
+    }
+
+    private mutating func observeAbsent(
+        now: ContinuousClock.Instant,
+        wasUnknown: Bool
+    ) -> [Effect] {
+        switch state {
+        case .monitoring:
+            return confirmAbsence(sampleCount: 1, now: now)
+
+        case let .confirming(sampleCount):
+            return confirmAbsence(sampleCount: sampleCount + 1, now: now)
+
+        case let .countdown(deadline):
+            // If an unknown sample covered the deadline, a later known absence
+            // starts a full new countdown instead of stopping retroactively.
+            if wasUnknown, now >= deadline {
+                return startCountdown(now: now)
+            }
+            return []
+
+        case let .snoozed(deadline):
+            // The same rule applies at the end of a snooze: uncertainty never
+            // consumes the user's warning interval.
+            if now >= deadline {
+                return startCountdown(now: now)
+            }
+            return []
+
+        case .stopRequested:
+            return []
+        }
+    }
+
+    private mutating func confirmAbsence(
+        sampleCount: Int,
+        now: ContinuousClock.Instant
+    ) -> [Effect] {
+        if sampleCount >= configuration.requiredNegativeSamples {
+            return startCountdown(now: now)
+        }
+        state = .confirming(negativeSampleCount: sampleCount)
+        return []
+    }
+
+    private mutating func startCountdown(
+        now: ContinuousClock.Instant
+    ) -> [Effect] {
+        let deadline = now.advanced(by: configuration.countdownDuration)
+        state = .countdown(deadline: deadline)
+        return [.countdownStarted(deadline: deadline)]
+    }
 }
 
 /// Keeps stable call episodes available while the session UI is temporarily
@@ -287,9 +479,11 @@ struct CallDetectionMatcher: Sendable {
             }
         )
 
-        // A browser title alone is deliberately insufficient. The title and
-        // active input must belong to the same allowlisted browser family.
-        // Hidden matching windows may sustain but never begin an episode.
+        // A recognized browser title is safe sustaining evidence for an
+        // already-active episode even if input temporarily disappears because
+        // the participant muted or the browser reconfigured its audio route.
+        // Beginning remains stricter: the title and active input must belong to
+        // the same allowlisted browser family, and the window must be visible.
         for window in snapshot.windows {
             guard let titlePlatform = platform(forWindowTitle: window.title)
             else {
@@ -304,13 +498,11 @@ struct CallDetectionMatcher: Sendable {
             else {
                 continue
             }
-            guard inputProcessIDs.contains(window.ownerProcessIdentifier)
-                || inputBrowserFamilies.contains(browserFamily)
-            else {
-                continue
-            }
             sustainingPlatforms.insert(titlePlatform)
-            if window.isOnScreen {
+            let hasActiveInput = inputProcessIDs.contains(
+                window.ownerProcessIdentifier
+            ) || inputBrowserFamilies.contains(browserFamily)
+            if window.isOnScreen && hasActiveInput {
                 beginningPlatforms.insert(titlePlatform)
             }
         }

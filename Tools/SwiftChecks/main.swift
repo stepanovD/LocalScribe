@@ -56,6 +56,7 @@ struct SwiftChecks {
         try await runRecoveryCheck()
         try await runMultiSessionRecoveryQueueCheck()
         try await runLifecycleResponsivenessCheck()
+        try await runDetectedCallAutomaticStopCheck()
         try await runVoiceProfileCheck()
         try runLatestRequestGenerationCheck()
         try await runPreparingTerminationCheck()
@@ -74,7 +75,7 @@ struct SwiftChecks {
         try await runCaptureBarrierCheck()
         try checkTerminationRequestCoalescing()
         try await runCallDetectionCheck()
-        print("swift checks: 31 passed")
+        print("swift checks: 32 passed")
     }
 
     private static func require(

@@ -10,11 +10,16 @@ final class DetectedCallPromptWindowController: NSObject {
         static let entryOffset: CGFloat = 8
     }
 
+    enum PresentationID: Hashable {
+        case start(UUID)
+        case autoStop(UUID)
+    }
+
     private var panel: DetectedCallBannerPanel?
     private var hostingController:
-        NSHostingController<DetectedCallPromptView>?
-    private var proposalID: UUID?
-    private var resolvedProposalID: UUID?
+        NSHostingController<AnyView>?
+    private var presentationID: PresentationID?
+    private var resolvedPresentationID: PresentationID?
     private var startAction: (() -> Void)?
     private var dismissAction: (() -> Void)?
 
@@ -26,19 +31,20 @@ final class DetectedCallPromptWindowController: NSObject {
         onStart: @escaping () -> Void,
         onDismiss: @escaping () -> Void
     ) {
-        guard resolvedProposalID != proposal.id else {
+        let presentationID = PresentationID.start(proposal.id)
+        guard resolvedPresentationID != presentationID else {
             return
         }
 
-        let isNewPresentation = proposalID != proposal.id
+        let isNewPresentation = self.presentationID != presentationID
         if isNewPresentation {
             invalidateCurrentPresentation()
-            proposalID = proposal.id
+            self.presentationID = presentationID
         }
         startAction = onStart
         dismissAction = onDismiss
 
-        let rootView = DetectedCallPromptView(
+        let rootView = AnyView(DetectedCallPromptView(
             applicationName: proposal.applicationName,
             canStart: canStart,
             languageMode: languageMode,
@@ -49,7 +55,7 @@ final class DetectedCallPromptWindowController: NSObject {
             onDismiss: { [weak self] in
                 self?.resolveWithDismiss()
             }
-        )
+        ))
 
         let panel = panel ?? makePanel()
         if let hostingController {
@@ -77,9 +83,65 @@ final class DetectedCallPromptWindowController: NSObject {
         }
     }
 
+    func showAutoStop(
+        prompt: DetectedCallAutoStopPrompt,
+        onKeepRecording: @escaping () -> Void,
+        onStopNow: @escaping () -> Void
+    ) {
+        let presentationID = PresentationID.autoStop(prompt.id)
+        guard resolvedPresentationID != presentationID else {
+            return
+        }
+
+        let isNewPresentation = self.presentationID != presentationID
+        if isNewPresentation {
+            invalidateCurrentPresentation()
+            self.presentationID = presentationID
+        }
+        startAction = onStopNow
+        dismissAction = onKeepRecording
+
+        let rootView = DetectedCallAutoStopPromptView(
+            applicationName: prompt.proposal.applicationName,
+            deadline: prompt.deadline,
+            onKeepRecording: { [weak self] in
+                self?.resolveWithDismiss()
+            },
+            onStopNow: { [weak self] in
+                self?.resolveWithStart()
+            }
+        )
+
+        let panel = panel ?? makePanel()
+        if let hostingController {
+            hostingController.rootView = AnyView(rootView)
+        } else {
+            let hostingController = NSHostingController(
+                rootView: AnyView(rootView)
+            )
+            self.hostingController = hostingController
+            panel.contentViewController = hostingController
+        }
+        panel.onCancel = { [weak self] in
+            self?.resolveWithDismiss()
+        }
+        panel.setAccessibilityLabel(
+            "Call appears to have ended in \(prompt.proposal.applicationName)"
+        )
+
+        let targetFrame = targetFrame(for: panel)
+        if isNewPresentation || !panel.isVisible {
+            present(panel, at: targetFrame)
+            announceAutoStop(prompt)
+        } else {
+            panel.setFrame(targetFrame, display: true)
+            panel.orderFrontRegardless()
+        }
+    }
+
     func close() {
-        if let proposalID {
-            resolvedProposalID = proposalID
+        if let presentationID {
+            resolvedPresentationID = presentationID
         }
         invalidateCurrentPresentation()
         hidePanel()
@@ -175,11 +237,30 @@ final class DetectedCallPromptWindowController: NSObject {
         )
     }
 
-    private func resolveWithStart() {
-        guard let proposalID, resolvedProposalID != proposalID else {
+    private func announceAutoStop(_ prompt: DetectedCallAutoStopPrompt) {
+        guard let panel else {
             return
         }
-        resolvedProposalID = proposalID
+        NSAccessibility.post(
+            element: panel,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement:
+                    "The \(prompt.proposal.applicationName) call appears to "
+                    + "have ended. Recording will stop in 10 seconds unless you "
+                    + "choose Keep Recording.",
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
+    }
+
+    private func resolveWithStart() {
+        guard let presentationID,
+              resolvedPresentationID != presentationID
+        else {
+            return
+        }
+        resolvedPresentationID = presentationID
         let action = startAction
         invalidateCurrentPresentation()
         hidePanel()
@@ -187,10 +268,12 @@ final class DetectedCallPromptWindowController: NSObject {
     }
 
     private func resolveWithDismiss() {
-        guard let proposalID, resolvedProposalID != proposalID else {
+        guard let presentationID,
+              resolvedPresentationID != presentationID
+        else {
             return
         }
-        resolvedProposalID = proposalID
+        resolvedPresentationID = presentationID
         let action = dismissAction
         invalidateCurrentPresentation()
         hidePanel()
@@ -198,7 +281,7 @@ final class DetectedCallPromptWindowController: NSObject {
     }
 
     private func invalidateCurrentPresentation() {
-        proposalID = nil
+        presentationID = nil
         startAction = nil
         dismissAction = nil
     }
@@ -299,7 +382,7 @@ private struct DetectedCallPromptView: View {
                 .accessibilityLabel("Start Recording")
                 .accessibilityHint(
                     canStart
-                        ? "Starts microphone and system audio capture"
+                        ? "Starts capture; a confirmed call end will show a warning before stopping"
                         : "Finish setup in Settings before recording"
                 )
 
@@ -334,9 +417,112 @@ private struct DetectedCallPromptView: View {
 
     private var subtitle: String {
         if canStart {
-            return applicationName
+            return "\(applicationName) · Auto-stop after confirmed end"
         }
         return "\(applicationName) · Complete setup first"
+    }
+
+    private var cardBackground: AnyShapeStyle {
+        if reduceTransparency {
+            return AnyShapeStyle(Color(nsColor: .windowBackgroundColor))
+        }
+        return AnyShapeStyle(.regularMaterial)
+    }
+}
+
+@MainActor
+private struct DetectedCallAutoStopPromptView: View {
+    let applicationName: String
+    let deadline: ContinuousClock.Instant
+    let onKeepRecording: () -> Void
+    let onStopNow: () -> Void
+
+    @Environment(\.accessibilityReduceTransparency)
+    private var reduceTransparency
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "phone.down.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 36, height: 36)
+                .background(Color.orange, in: RoundedRectangle(
+                    cornerRadius: 9,
+                    style: .continuous
+                ))
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Call appears to have ended")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text(
+                        "\(applicationName) · Stopping recording in "
+                            + "\(remainingSeconds()) seconds"
+                    )
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+
+            Button("Keep Recording", action: onKeepRecording)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .help("Keep recording and check again later")
+                .accessibilityHint(
+                    "Cancels this countdown and keeps capture running"
+                )
+
+            Button("Stop Now", role: .destructive, action: onStopNow)
+                .controlSize(.large)
+                .help("Stop recording and finalize the transcript now")
+                .accessibilityHint(
+                    "Stops capture and finalizes the transcript now"
+                )
+
+            Button(action: onKeepRecording) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 24, height: 24)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Keep Recording")
+            .accessibilityLabel("Close and Keep Recording")
+            .accessibilityHint(
+                "Closes this warning and keeps capture running"
+            )
+        }
+        .padding(.horizontal, 14)
+        .frame(width: 516, height: 72)
+        .background(cardBackground, in: RoundedRectangle(
+            cornerRadius: 18,
+            style: .continuous
+        ))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.55))
+        }
+        .shadow(color: .black.opacity(0.20), radius: 10, y: 5)
+        .padding(12)
+        .frame(width: 540, height: 96)
+    }
+
+    private func remainingSeconds() -> Int {
+        let now = ContinuousClock.now
+        guard now < deadline else {
+            return 0
+        }
+        let components = now.duration(to: deadline).components
+        return Int(clamping: components.seconds)
+            + (components.attoseconds > 0 ? 1 : 0)
     }
 
     private var cardBackground: AnyShapeStyle {

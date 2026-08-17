@@ -32,8 +32,9 @@ The repository contains one working macOS technical vertical:
 
 - SwiftUI/AppKit menu bar shell with a separate visible consent step;
 - metadata-only, debounced Zoom, Yandex Telemost, Google Meet, and Skype call
-  detection with a floating proposal panel that never starts capture
-  automatically;
+  detection with floating start and end-confirmation panels; detection never
+  starts capture automatically, while a detected-start recording can stop
+  after a visible warning when the same call appears to have ended;
 - independent ScreenCaptureKit system-audio and AVAudioEngine microphone
   adapters, with best-effort system voice processing on the microphone path
   plus grouped cross-source echo suppression when Whisper splits the same
@@ -87,7 +88,16 @@ it shows a floating proposal with **Start Recording** and **Not Now**. You can
 always choose **New transcript…** manually instead. TCC prompts are requested
 only after the visible **Start Recording** action. The app can then pause,
 explicitly resume, stop, show source health, and open the last published
-Markdown file.
+Markdown file. A recording started from a detected-call proposal is tied to
+that proposal's exact UUID for stop authority. Ongoing presence is evaluated at
+the provider/platform level, so another call surface from the same platform is
+treated as a continuation. After ten consecutive one-second observations no
+longer find that platform, LocalScribe shows a ten-second countdown before
+stopping.
+Choose **Keep Recording** to cancel the countdown and snooze another warning
+for five minutes, or **Stop Now** to finish immediately. Closing the warning or
+pressing Escape keeps recording. Manual recordings never stop from call
+detection.
 
 On the first Screen Recording grant, macOS may require LocalScribe to be quit
 and reopened before capture is enabled; the app reports that state explicitly
@@ -235,10 +245,12 @@ The architecture is fixed before implementation:
 
 ## Deliberate Stage 0 limits
 
-- Detection is proposal-only and best effort. Native Zoom, Yandex Telemost,
+- Detection is best effort. Native Zoom, Yandex Telemost,
   and compatible Skype clients use local process/audio metadata; Google Meet
   and other browser calls additionally depend on privacy-gated window titles.
-  Manual start remains available.
+  It never starts capture. Only a recording explicitly started from its
+  matching proposal can be auto-stopped after a visible countdown; manual
+  start and manual Stop remain available.
 - Remote-speaker labels come from lightweight, model-free acoustic clustering.
   Each call can still create up to eight new anonymous clusters. Explicitly
   saved compatible profiles may supply names across calls, while unmatched or

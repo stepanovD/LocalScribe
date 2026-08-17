@@ -2,6 +2,21 @@ import AppKit
 import Combine
 import Foundation
 
+struct DetectedCallAutoStopPrompt: Identifiable, Sendable, Equatable {
+    let id: UUID
+    let proposal: DetectedCallProposal
+    let deadline: ContinuousClock.Instant
+
+    func remainingSeconds(at now: ContinuousClock.Instant = .now) -> Int {
+        guard now < deadline else {
+            return 0
+        }
+        let components = now.duration(to: deadline).components
+        let wholeSeconds = Int(clamping: components.seconds)
+        return wholeSeconds + (components.attoseconds > 0 ? 1 : 0)
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var session = SessionSnapshot.idle
@@ -16,6 +31,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var voiceProfileFailure: String?
     @Published private(set) var isVoiceProfileOperationInProgress = false
     @Published private(set) var detectedCallProposal: DetectedCallProposal?
+    @Published private(set) var detectedCallAutoStopPrompt:
+        DetectedCallAutoStopPrompt?
     @Published var defaultLanguageMode: CoreLanguageMode {
         didSet {
             languagePreferences.defaultLanguageMode = defaultLanguageMode
@@ -31,7 +48,12 @@ final class AppModel: ObservableObject {
     private let consentIssuer = VisibleConsentIssuer()
     private var updatesTask: Task<Void, Never>?
     private var callDetectionUpdatesTask: Task<Void, Never>?
+    private var callPresenceUpdatesTask: Task<Void, Never>?
     private var callDetectionOfferLedger = CallDetectionOfferLedger()
+    private var activeDetectedCallProposal: DetectedCallProposal?
+    private var detectedCallAutoStopReducer: DetectedCallAutoStopReducer?
+    private var detectedCallAutoStopTimer: Task<Void, Never>?
+    private var detectedCallAutoStopGeneration: UInt64 = 0
     private var voiceProfileRefreshGeneration = LatestRequestGeneration()
 
     init() {
@@ -98,10 +120,15 @@ final class AppModel: ObservableObject {
     deinit {
         updatesTask?.cancel()
         callDetectionUpdatesTask?.cancel()
+        callPresenceUpdatesTask?.cancel()
+        detectedCallAutoStopTimer?.cancel()
     }
 
     var menuBarSymbol: String {
-        switch session.state {
+        if detectedCallAutoStopPrompt != nil {
+            return "phone.down.fill"
+        }
+        return switch session.state {
         case .detected, .awaitingConsent:
             "phone.badge.waveform"
         case .recording:
@@ -118,7 +145,10 @@ final class AppModel: ObservableObject {
     }
 
     var menuBarTitle: String {
-        switch session.state {
+        if detectedCallAutoStopPrompt != nil {
+            return "Call appears to have ended"
+        }
+        return switch session.state {
         case .detected, .awaitingConsent:
             "Call detected"
         case .recording:
@@ -213,12 +243,22 @@ final class AppModel: ObservableObject {
             localSpeakerName: "Me",
             languageMode: meetingLanguageMode
         )
+        if let acceptedProposal {
+            beginDetectedCallAutoStopMonitoring(for: acceptedProposal)
+        } else {
+            clearDetectedCallAutoStopMonitoring()
+        }
         Task {
-            await controller.start(
+            let started = await controller.start(
                 after: token,
                 request: request,
                 expectedDetectedProposalID: expectedProposalID
             )
+            if !started, let acceptedProposal,
+               activeDetectedCallProposal?.id == acceptedProposal.id
+            {
+                clearDetectedCallAutoStopMonitoring()
+            }
             await refreshSetupState()
         }
     }
@@ -263,7 +303,29 @@ final class AppModel: ObservableObject {
         guard let controller else {
             return
         }
+        clearDetectedCallAutoStopMonitoring()
         Task { await controller.stop() }
+    }
+
+    func keepRecordingAfterCallEndWarning(promptID: UUID) {
+        guard detectedCallAutoStopPrompt?.id == promptID,
+              let proposal = activeDetectedCallProposal,
+              var reducer = detectedCallAutoStopReducer
+        else {
+            return
+        }
+        let effects = reducer.keepRecording(now: .now)
+        detectedCallAutoStopReducer = reducer
+        applyDetectedCallAutoStopEffects(effects, for: proposal)
+    }
+
+    func stopNowAfterCallEndWarning(promptID: UUID) {
+        guard detectedCallAutoStopPrompt?.id == promptID,
+              let proposal = activeDetectedCallProposal
+        else {
+            return
+        }
+        requestDetectedCallStop(proposalID: proposal.id)
     }
 
     func retryRecovery() {
@@ -457,8 +519,10 @@ final class AppModel: ObservableObject {
 
     func prepareForTermination() async {
         callDetectionUpdatesTask?.cancel()
+        callPresenceUpdatesTask?.cancel()
         detectedCallProposal = nil
         callDetectionOfferLedger.removeAll()
+        clearDetectedCallAutoStopMonitoring()
         await callDetectionMonitor.stop()
         await controller?.prepareForTermination()
     }
@@ -505,6 +569,15 @@ final class AppModel: ObservableObject {
                     return
                 }
                 self.session = value
+                if value.state == .finalizing
+                    || value.state == .recoveryRequired
+                    || value.state == .failedToStart
+                    || value.state == .complete
+                    || value.state == .incompleteSources
+                    || value.state == .interrupted
+                {
+                    self.clearDetectedCallAutoStopMonitoring()
+                }
                 if self.captureLifecycleOwnsCurrentCalls(value.state) {
                     self.suppressActiveDetectedCalls()
                 } else {
@@ -522,6 +595,16 @@ final class AppModel: ObservableObject {
                     return
                 }
                 await self.handleCallDetectionEvent(event)
+            }
+        }
+
+        let presenceObservations = callDetectionMonitor.presenceObservations
+        callPresenceUpdatesTask = Task { [weak self] in
+            for await observation in presenceObservations {
+                guard !Task.isCancelled, let self else {
+                    return
+                }
+                self.handleCallPresenceObservation(observation)
             }
         }
     }
@@ -564,10 +647,162 @@ final class AppModel: ObservableObject {
                 return
             }
             detectedCallProposal = nil
-            await controller.dismissProposal(
-                expectedDetectedProposalID: proposal.id
+            await controller.stopDetectedCall(
+                expectedProposalID: proposal.id
             )
         }
+    }
+
+    private func beginDetectedCallAutoStopMonitoring(
+        for proposal: DetectedCallProposal
+    ) {
+        clearDetectedCallAutoStopMonitoring()
+        activeDetectedCallProposal = proposal
+        detectedCallAutoStopReducer = DetectedCallAutoStopReducer(
+            platform: proposal.platform
+        )
+    }
+
+    private func handleCallPresenceObservation(
+        _ observation: CallPresenceObservation
+    ) {
+        guard let proposal = activeDetectedCallProposal,
+              var reducer = detectedCallAutoStopReducer
+        else {
+            return
+        }
+        let effects = reducer.observe(observation, now: .now)
+        detectedCallAutoStopReducer = reducer
+        applyDetectedCallAutoStopEffects(effects, for: proposal)
+    }
+
+    private func applyDetectedCallAutoStopEffects(
+        _ effects: [DetectedCallAutoStopReducer.Effect],
+        for proposal: DetectedCallProposal
+    ) {
+        guard activeDetectedCallProposal?.id == proposal.id else {
+            return
+        }
+
+        for effect in effects {
+            switch effect {
+            case .monitoringResumed:
+                hideDetectedCallAutoStopPrompt()
+
+            case let .countdownStarted(deadline):
+                detectedCallAutoStopPrompt = DetectedCallAutoStopPrompt(
+                    id: UUID(),
+                    proposal: proposal,
+                    deadline: deadline
+                )
+                scheduleDetectedCallAutoStopTick(
+                    at: deadline,
+                    proposalID: proposal.id
+                )
+
+            case let .snoozed(deadline):
+                detectedCallAutoStopPrompt = nil
+                scheduleDetectedCallAutoStopTick(
+                    at: deadline,
+                    proposalID: proposal.id
+                )
+
+            case .stopRequested:
+                requestDetectedCallStop(proposalID: proposal.id)
+            }
+        }
+    }
+
+    private func scheduleDetectedCallAutoStopTick(
+        at deadline: ContinuousClock.Instant,
+        proposalID: UUID
+    ) {
+        invalidateDetectedCallAutoStopTimer()
+        let generation = detectedCallAutoStopGeneration
+        detectedCallAutoStopTimer = Task { [weak self] in
+            let now = ContinuousClock.now
+            if now < deadline {
+                do {
+                    try await Task<Never, Never>.sleep(
+                        for: now.duration(to: deadline)
+                    )
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled, let self else {
+                return
+            }
+            self.handleDetectedCallAutoStopTick(
+                proposalID: proposalID,
+                generation: generation
+            )
+        }
+    }
+
+    private func handleDetectedCallAutoStopTick(
+        proposalID: UUID,
+        generation: UInt64
+    ) {
+        guard generation == detectedCallAutoStopGeneration,
+              activeDetectedCallProposal?.id == proposalID,
+              let proposal = activeDetectedCallProposal,
+              var reducer = detectedCallAutoStopReducer
+        else {
+            return
+        }
+        detectedCallAutoStopTimer = nil
+        let now = ContinuousClock.now
+        let effects = reducer.tick(now: now)
+        detectedCallAutoStopReducer = reducer
+        if effects.isEmpty,
+           case let .countdown(deadline) = reducer.state
+        {
+            if now < deadline {
+                scheduleDetectedCallAutoStopTick(
+                    at: deadline,
+                    proposalID: proposal.id
+                )
+            } else {
+                // A due countdown can remain pending only while presence is
+                // unknown. Keep recording and remove the misleading zero;
+                // a later known absence starts a fresh full countdown.
+                detectedCallAutoStopPrompt = nil
+            }
+        }
+        applyDetectedCallAutoStopEffects(effects, for: proposal)
+    }
+
+    private func requestDetectedCallStop(proposalID: UUID) {
+        guard activeDetectedCallProposal?.id == proposalID,
+              let controller
+        else {
+            return
+        }
+        clearDetectedCallAutoStopMonitoring()
+        Task {
+            await controller.stopDetectedCall(
+                expectedProposalID: proposalID
+            )
+        }
+    }
+
+    private func hideDetectedCallAutoStopPrompt() {
+        detectedCallAutoStopPrompt = nil
+        invalidateDetectedCallAutoStopTimer()
+    }
+
+    private func clearDetectedCallAutoStopMonitoring() {
+        activeDetectedCallProposal = nil
+        detectedCallAutoStopReducer = nil
+        detectedCallAutoStopPrompt = nil
+        invalidateDetectedCallAutoStopTimer()
+    }
+
+    private func invalidateDetectedCallAutoStopTimer() {
+        detectedCallAutoStopGeneration &+= 1
+        detectedCallAutoStopTimer?.cancel()
+        detectedCallAutoStopTimer = nil
     }
 
     private func offerPendingDetectedCallIfPossible() async {

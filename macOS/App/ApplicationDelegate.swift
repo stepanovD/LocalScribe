@@ -54,18 +54,21 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         // their previous values inside this callback.
         Publishers.CombineLatest4(
             model.$detectedCallProposal,
+            model.$detectedCallAutoStopPrompt,
             model.$hasVaultSelection,
-            model.$hasModelSelection,
-            model.$meetingLanguageMode
+            model.$hasModelSelection
         )
+            .combineLatest(model.$meetingLanguageMode)
             .sink {
                 [weak self, weak model]
-                proposal, hasVault, hasModel, languageMode in
+                values, languageMode in
                 guard let self, let model else {
                     return
                 }
+                let (proposal, autoStopPrompt, hasVault, hasModel) = values
                 self.refreshCallPrompt(
                     proposal: proposal,
+                    autoStopPrompt: autoStopPrompt,
                     canStart: model.isRecordingEngineAvailable
                         && hasVault
                         && hasModel,
@@ -77,10 +80,33 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshCallPrompt(
         proposal: DetectedCallProposal?,
+        autoStopPrompt: DetectedCallAutoStopPrompt?,
         canStart: Bool,
         languageMode: CoreLanguageMode
     ) {
-        guard let model, let proposal else {
+        guard let model else {
+            callPrompt.close()
+            return
+        }
+
+        if let autoStopPrompt {
+            callPrompt.showAutoStop(
+                prompt: autoStopPrompt,
+                onKeepRecording: { [weak model] in
+                    model?.keepRecordingAfterCallEndWarning(
+                        promptID: autoStopPrompt.id
+                    )
+                },
+                onStopNow: { [weak model] in
+                    model?.stopNowAfterCallEndWarning(
+                        promptID: autoStopPrompt.id
+                    )
+                }
+            )
+            return
+        }
+
+        guard let proposal else {
             callPrompt.close()
             return
         }
