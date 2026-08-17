@@ -6,6 +6,19 @@ LocalScribe is a macOS 14+ menu-bar app with a portable C++20 core. Keep platfor
 
 ## Build, Test, and Development Commands
 
+The root `Makefile` wraps every script in `Scripts/`. Run `make help` for the
+complete command list and see `Docs/Development.ru.md` for arguments and
+examples. The main entry points are:
+
+- `make build` creates the optimized release app bundle; use `make build-debug` for a debug bundle.
+- `make test` runs the Core tests, standalone Swift checks, and Swift XCTest; full Xcode is required for XCTest.
+- `make verify` runs the required complete local gate before review.
+- `make soak-smoke`, `make soak-accelerated`, and `make soak` run the short, accelerated, and two-hour stability probes.
+- `make whisper-smoke MODEL=/path/to/model.bin WAV=/path/to/input.wav` validates real Whisper ASR.
+- `make github-release` verifies, builds, and packages the technical GitHub pre-release; overwrite and skip-verification variants are listed by `make help`.
+
+The underlying scripts remain available directly:
+
 - `Scripts/build-app-bundle.sh debug` builds and ad-hoc signs `Build/LocalScribe.app`; use `release` for an optimized local bundle.
 - `Scripts/run-core-tests.sh` compiles and runs the portable C++ contract suite.
 - `Scripts/run-swift-tests.sh` runs XCTest and requires a full Xcode installation.
