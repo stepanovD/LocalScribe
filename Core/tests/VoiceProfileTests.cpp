@@ -184,7 +184,7 @@ PRAGMA user_version = 1;
             nullptr),
         SQLITE_OK);
     LS_CHECK_EQ(sqlite3_step(statement), SQLITE_ROW);
-    LS_CHECK_EQ(sqlite3_column_int(statement, 0), 2);
+    LS_CHECK_EQ(sqlite3_column_int(statement, 0), 3);
     sqlite3_finalize(statement);
     LS_CHECK_EQ(
         sqlite3_prepare_v2(

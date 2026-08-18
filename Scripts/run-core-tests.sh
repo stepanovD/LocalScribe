@@ -20,10 +20,14 @@ clang++ \
     "$repo_root/Core/src/storage/Migrations.cpp" \
     "$repo_root/Core/src/storage/RecoveryJournal.cpp" \
     "$repo_root/Core/tests/TestMain.cpp" \
+    "$repo_root/Core/tests/AsrTimelineBatchTests.cpp" \
     "$repo_root/Core/tests/BackendTests.cpp" \
     "$repo_root/Core/tests/ContractTests.cpp" \
+    "$repo_root/Core/tests/DiarizationInertiaTests.cpp" \
     "$repo_root/Core/tests/JournalRecoveryTests.cpp" \
     "$repo_root/Core/tests/MarkdownGoldenTests.cpp" \
+    "$repo_root/Core/tests/PendingJournalTests.cpp" \
+    "$repo_root/Core/tests/SpeakerSwitchContractTests.cpp" \
     "$repo_root/Core/tests/StateMachineTests.cpp" \
     "$repo_root/Core/tests/VoiceProfileTests.cpp" \
     -lsqlite3 \

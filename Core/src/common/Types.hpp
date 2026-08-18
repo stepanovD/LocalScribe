@@ -71,6 +71,8 @@ struct AudioWindow {
     std::int64_t overloadGapStartTimeNs{};
     std::int64_t overloadGapEndTimeNs{};
     bool overloadGapBefore{};
+    /* Ordered runtime control item; it carries no captured audio callback. */
+    bool inferenceBoundaryOnly{};
 };
 
 struct AsrHypothesis {
@@ -89,6 +91,19 @@ struct AsrHypothesis {
     std::vector<float> speakerEmbedding;
 };
 
+/*
+ * A batch is emitted only after ASR has fully processed the represented audio
+ * interval.  Empty batches are meaningful: their watermark lets downstream
+ * components advance deterministic, audio-time deadlines through silence.
+ */
+struct AsrTimelineBatch {
+    std::uint64_t sourceId{};
+    std::int64_t processedStartTimeNs{};
+    std::int64_t finalizedThroughTimeNs{};
+    bool discontinuityBefore{};
+    std::vector<AsrHypothesis> hypotheses;
+};
+
 struct SpeakerTurn {
     StableId stableId{};
     std::uint64_t sourceId{};
@@ -98,6 +113,47 @@ struct SpeakerTurn {
     std::string speakerLabel;
     float confidence{};
     std::uint32_t revision{};
+};
+
+enum class SpeakerTurnDecisionKind {
+    commit,
+    hold,
+};
+
+struct SpeakerTurnDecision {
+    SpeakerTurnDecisionKind kind{SpeakerTurnDecisionKind::commit};
+    SpeakerTurn turn;
+    std::uint64_t pendingGroupId{};
+    std::int64_t deadlineTimeNs{};
+};
+
+enum class PendingSpeakerResolutionReason {
+    confirmed,
+    contradicted,
+    timeout,
+    discontinuity,
+    pause,
+    endOfStream,
+    capacity,
+};
+
+struct PendingSpeakerResolution {
+    std::uint64_t pendingGroupId{};
+    PendingSpeakerResolutionReason reason{
+        PendingSpeakerResolutionReason::contradicted};
+    std::vector<SpeakerTurn> turns;
+};
+
+struct DiarizationUpdate {
+    /* Exactly one decision for every input hypothesis, in input order. */
+    std::vector<SpeakerTurnDecision> decisions;
+    /* A resolution includes every revision staged in the referenced group. */
+    std::vector<PendingSpeakerResolution> resolutions;
+};
+
+enum class DiarizationFlushReason {
+    pause,
+    endOfStream,
 };
 
 struct TranscriptSegment {

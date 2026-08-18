@@ -15,6 +15,7 @@
 #include <limits>
 #include <numbers>
 #include <numeric>
+#include <span>
 #include <vector>
 
 using namespace localscribe;
@@ -53,6 +54,64 @@ VoiceProfile voiceProfile(
     return profile;
 }
 
+Expected<std::vector<SpeakerTurn>> assignBatchForTest(
+    IDiarizationBackend &backend,
+    std::uint64_t sourceId,
+    std::span<const AsrHypothesis> hypotheses)
+{
+    AsrTimelineBatch batch;
+    batch.sourceId = sourceId;
+    batch.hypotheses.assign(hypotheses.begin(), hypotheses.end());
+    if (!hypotheses.empty()) {
+        const auto earliest = std::min_element(
+            hypotheses.begin(),
+            hypotheses.end(),
+            [](const AsrHypothesis &left, const AsrHypothesis &right) {
+                return left.startTimeNs < right.startTimeNs;
+            });
+        batch.processedStartTimeNs = earliest->startTimeNs;
+        batch.finalizedThroughTimeNs = std::max_element(
+            hypotheses.begin(),
+            hypotheses.end(),
+            [](const AsrHypothesis &left, const AsrHypothesis &right) {
+                return left.endTimeNs < right.endTimeNs;
+            })->endTimeNs;
+    }
+
+    auto update = backend.assign(batch);
+    if (!update) {
+        return update.error();
+    }
+    LS_CHECK_EQ(update.value().decisions.size(), hypotheses.size());
+
+    std::vector<SpeakerTurn> turns;
+    turns.reserve(update.value().decisions.size());
+    for (const auto &decision : update.value().decisions) {
+        SpeakerTurn resolved = decision.turn;
+        for (const auto &resolution : update.value().resolutions) {
+            for (const auto &turn : resolution.turns) {
+                if (turn.stableId == resolved.stableId
+                    && turn.revision == resolved.revision) {
+                    resolved = turn;
+                }
+            }
+        }
+        turns.push_back(std::move(resolved));
+    }
+    return turns;
+}
+
+Expected<std::vector<SpeakerTurn>> assignBatchForTest(
+    IDiarizationBackend &backend,
+    std::span<const AsrHypothesis> hypotheses)
+{
+    LS_CHECK(!hypotheses.empty());
+    return assignBatchForTest(
+        backend,
+        hypotheses.front().sourceId,
+        hypotheses);
+}
+
 } // namespace
 
 LS_TEST(fixture_backend_requires_explicit_test_configuration)
@@ -86,19 +145,23 @@ LS_TEST(fixture_backend_is_deterministic_and_revisioned)
     auto first = backend.value()->accept(window);
     LS_CHECK(first);
     LS_CHECK_EQ(first.value().size(), std::size_t{1});
-    LS_CHECK_EQ(first.value()[0].text, std::string{"fixture cue 42"});
-    LS_CHECK_EQ(first.value()[0].revision, std::uint32_t{1});
-    LS_CHECK(first.value()[0].final);
-    LS_CHECK_EQ(first.value()[0].language, std::string{"en"});
+    LS_CHECK_EQ(first.value()[0].hypotheses.size(), std::size_t{1});
+    const auto &firstHypothesis = first.value()[0].hypotheses[0];
+    LS_CHECK_EQ(firstHypothesis.text, std::string{"fixture cue 42"});
+    LS_CHECK_EQ(firstHypothesis.revision, std::uint32_t{1});
+    LS_CHECK(firstHypothesis.final);
+    LS_CHECK_EQ(firstHypothesis.language, std::string{"en"});
 
     window.sequenceNumber = 11;
     window.samples.front() = -0.042F;
     auto revision = backend.value()->accept(window);
     LS_CHECK(revision);
-    LS_CHECK_EQ(revision.value()[0].stableId, first.value()[0].stableId);
-    LS_CHECK_EQ(revision.value()[0].revision, std::uint32_t{2});
+    LS_CHECK_EQ(revision.value()[0].hypotheses.size(), std::size_t{1});
+    const auto &revisedHypothesis = revision.value()[0].hypotheses[0];
+    LS_CHECK_EQ(revisedHypothesis.stableId, firstHypothesis.stableId);
+    LS_CHECK_EQ(revisedHypothesis.revision, std::uint32_t{2});
     LS_CHECK_EQ(
-        revision.value()[0].text,
+        revisedHypothesis.text,
         std::string{"fixture cue 42 revised"});
 }
 
@@ -148,26 +211,18 @@ LS_TEST(source_aware_diarization_preserves_source_identity)
     hypothesis.sourceId = 11;
     hypothesis.final = true;
     hypothesis.revision = 1;
-    AudioWindow microphone;
-    microphone.sourceId = 11;
-    /*
-     * The configured source ID is authoritative. A stale/mistyped kind must
-     * never make microphone speech remote or system speech local.
-     */
-    microphone.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
-    auto local = backend.value()->assign(
-        microphone,
+    auto local = assignBatchForTest(
+        *backend.value(),
+        11,
         std::span<const AsrHypothesis>(&hypothesis, 1));
     LS_CHECK(local);
     LS_CHECK_EQ(local.value()[0].speakerId, std::uint64_t{1});
     LS_CHECK_EQ(local.value()[0].speakerLabel, std::string{"Me"});
 
     hypothesis.sourceId = 22;
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_MICROPHONE;
-    auto remote = backend.value()->assign(
-        system,
+    auto remote = assignBatchForTest(
+        *backend.value(),
+        22,
         std::span<const AsrHypothesis>(&hypothesis, 1));
     LS_CHECK(remote);
     LS_CHECK(remote.value()[0].speakerId != 1);
@@ -181,14 +236,12 @@ LS_TEST(diarization_rejects_hypotheses_from_a_different_source)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis mismatched;
     mismatched.sourceId = 11;
     mismatched.final = true;
-    const auto result = backend.value()->assign(
-        system,
+    const auto result = assignBatchForTest(
+        *backend.value(),
+        22,
         std::span<const AsrHypothesis>(&mismatched, 1));
     LS_CHECK(!result);
     LS_CHECK_EQ(result.error().code, LS_INVALID_ARGUMENT);
@@ -201,9 +254,6 @@ LS_TEST(acoustic_diarization_clusters_remote_voices)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
 
     AsrHypothesis first;
     first.stableId[15] = 1;
@@ -213,7 +263,7 @@ LS_TEST(acoustic_diarization_clusters_remote_voices)
     first.revision = 1;
     first.final = true;
     first.speakerEmbedding = {1.0F, 0.0F};
-    auto firstTurn = backend.value()->assign(system, {&first, 1});
+    auto firstTurn = assignBatchForTest(*backend.value(), {&first, 1});
     LS_CHECK(firstTurn);
     LS_CHECK_EQ(
         firstTurn.value()[0].speakerLabel,
@@ -224,7 +274,7 @@ LS_TEST(acoustic_diarization_clusters_remote_voices)
     second.startTimeNs = 3'000'000'000;
     second.endTimeNs = 4'000'000'000;
     second.speakerEmbedding = {0.0F, 1.0F};
-    auto secondCandidate = backend.value()->assign(system, {&second, 1});
+    auto secondCandidate = assignBatchForTest(*backend.value(), {&second, 1});
     LS_CHECK(secondCandidate);
     LS_CHECK_EQ(
         secondCandidate.value()[0].speakerId,
@@ -236,7 +286,7 @@ LS_TEST(acoustic_diarization_clusters_remote_voices)
     secondConfirmed.endTimeNs = 5'000'000'000;
     secondConfirmed.speakerEmbedding = {0.01F, 0.99F};
     auto secondTurn =
-        backend.value()->assign(system, {&secondConfirmed, 1});
+        assignBatchForTest(*backend.value(), {&secondConfirmed, 1});
     LS_CHECK(secondTurn);
     LS_CHECK_EQ(
         secondTurn.value()[0].speakerLabel,
@@ -251,7 +301,7 @@ LS_TEST(acoustic_diarization_clusters_remote_voices)
     firstAgain.endTimeNs = 7'000'000'000;
     firstAgain.speakerEmbedding = {0.99F, 0.01F};
     auto firstAgainTurn =
-        backend.value()->assign(system, {&firstAgain, 1});
+        assignBatchForTest(*backend.value(), {&firstAgain, 1});
     LS_CHECK(firstAgainTurn);
     LS_CHECK_EQ(
         firstAgainTurn.value()[0].speakerId,
@@ -270,11 +320,9 @@ LS_TEST(acoustic_diarization_never_labels_system_audio_as_local)
     hypothesis.sourceId = 22;
     hypothesis.final = true;
     hypothesis.speakerEmbedding = {1.0F, 0.0F};
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_MICROPHONE;
-    const auto remote = backend.value()->assign(
-        system,
+    const auto remote = assignBatchForTest(
+        *backend.value(),
+        22,
         std::span<const AsrHypothesis>(&hypothesis, 1));
     LS_CHECK(remote);
     LS_CHECK(remote.value()[0].speakerId != std::uint64_t{1});
@@ -282,11 +330,9 @@ LS_TEST(acoustic_diarization_never_labels_system_audio_as_local)
 
     hypothesis.sourceId = 11;
     hypothesis.stableId[15] = 2;
-    AudioWindow microphone;
-    microphone.sourceId = 11;
-    microphone.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
-    const auto local = backend.value()->assign(
-        microphone,
+    const auto local = assignBatchForTest(
+        *backend.value(),
+        11,
         std::span<const AsrHypothesis>(&hypothesis, 1));
     LS_CHECK(local);
     LS_CHECK_EQ(local.value()[0].speakerId, std::uint64_t{1});
@@ -300,9 +346,6 @@ LS_TEST(acoustic_diarization_requires_repeated_novel_speaker_evidence)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -331,15 +374,15 @@ LS_TEST(acoustic_diarization_requires_repeated_novel_speaker_evidence)
     const auto secondAgain =
         hypothesis(5, 0.58F, 5'000'000'000);
 
-    const auto firstTurn = backend.value()->assign(system, {&first, 1});
+    const auto firstTurn = assignBatchForTest(*backend.value(), {&first, 1});
     const auto candidateTurn =
-        backend.value()->assign(system, {&secondCandidate, 1});
+        assignBatchForTest(*backend.value(), {&secondCandidate, 1});
     const auto secondTurn =
-        backend.value()->assign(system, {&secondConfirmed, 1});
+        assignBatchForTest(*backend.value(), {&secondConfirmed, 1});
     const auto firstAgainTurn =
-        backend.value()->assign(system, {&firstAgain, 1});
+        assignBatchForTest(*backend.value(), {&firstAgain, 1});
     const auto secondAgainTurn =
-        backend.value()->assign(system, {&secondAgain, 1});
+        assignBatchForTest(*backend.value(), {&secondAgain, 1});
     LS_CHECK(firstTurn);
     LS_CHECK(candidateTurn);
     LS_CHECK(secondTurn);
@@ -366,9 +409,6 @@ LS_TEST(acoustic_diarization_absorbs_consistent_gray_zone_voice_variation)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -388,13 +428,13 @@ LS_TEST(acoustic_diarization_absorbs_consistent_gray_zone_voice_variation)
     const auto variationThree = hypothesis(4, 0.55F, 4'000'000'000);
 
     const auto originalTurn =
-        backend.value()->assign(system, {&original, 1});
+        assignBatchForTest(*backend.value(), {&original, 1});
     const auto firstVariationTurn =
-        backend.value()->assign(system, {&variationOne, 1});
+        assignBatchForTest(*backend.value(), {&variationOne, 1});
     const auto secondVariationTurn =
-        backend.value()->assign(system, {&variationTwo, 1});
+        assignBatchForTest(*backend.value(), {&variationTwo, 1});
     const auto thirdVariationTurn =
-        backend.value()->assign(system, {&variationThree, 1});
+        assignBatchForTest(*backend.value(), {&variationThree, 1});
     LS_CHECK(originalTurn);
     LS_CHECK(firstVariationTurn);
     LS_CHECK(secondVariationTurn);
@@ -417,9 +457,6 @@ LS_TEST(acoustic_diarization_can_confirm_a_similar_voice_after_a_pause)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -438,11 +475,11 @@ LS_TEST(acoustic_diarization_can_confirm_a_similar_voice_after_a_pause)
     const auto confirmation = hypothesis(3, 0.54F, 6'000'000'000);
 
     const auto originalTurn =
-        backend.value()->assign(system, {&original, 1});
+        assignBatchForTest(*backend.value(), {&original, 1});
     const auto candidateTurn =
-        backend.value()->assign(system, {&candidate, 1});
+        assignBatchForTest(*backend.value(), {&candidate, 1});
     const auto confirmedTurn =
-        backend.value()->assign(system, {&confirmation, 1});
+        assignBatchForTest(*backend.value(), {&confirmation, 1});
     LS_CHECK(originalTurn);
     LS_CHECK(candidateTurn);
     LS_CHECK(confirmedTurn);
@@ -461,9 +498,6 @@ LS_TEST(acoustic_diarization_ignores_a_single_acoustic_outlier)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -482,11 +516,11 @@ LS_TEST(acoustic_diarization_ignores_a_single_acoustic_outlier)
     const auto recovered = hypothesis(3, 0.02F, 3'000'000'000);
 
     const auto originalTurn =
-        backend.value()->assign(system, {&original, 1});
+        assignBatchForTest(*backend.value(), {&original, 1});
     const auto outlierTurn =
-        backend.value()->assign(system, {&outlier, 1});
+        assignBatchForTest(*backend.value(), {&outlier, 1});
     const auto recoveredTurn =
-        backend.value()->assign(system, {&recovered, 1});
+        assignBatchForTest(*backend.value(), {&recovered, 1});
     LS_CHECK(originalTurn);
     LS_CHECK(outlierTurn);
     LS_CHECK(recoveredTurn);
@@ -504,9 +538,6 @@ LS_TEST(acoustic_diarization_ignores_false_turn_for_a_strong_voice_match)
     LS_CHECK(backend);
     LS_CHECK(backend.value()->prepare(DiarizationConfiguration{}));
 
-    AudioWindow system;
-    system.sourceId = 2;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
 
     AsrHypothesis before;
     before.stableId[15] = 1;
@@ -518,7 +549,7 @@ LS_TEST(acoustic_diarization_ignores_false_turn_for_a_strong_voice_match)
     before.speakerTurnAfter = true;
     before.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
     before.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
-    auto first = backend.value()->assign(system, {&before, 1});
+    auto first = assignBatchForTest(*backend.value(), {&before, 1});
     LS_CHECK(first);
 
     AsrHypothesis after = before;
@@ -527,7 +558,7 @@ LS_TEST(acoustic_diarization_ignores_false_turn_for_a_strong_voice_match)
     after.endTimeNs = 2'100'000'000;
     after.speakerTurnAfter = false;
     after.speakerEmbedding = speakerEmbeddingAtAngle(0.10F);
-    auto second = backend.value()->assign(system, {&after, 1});
+    auto second = assignBatchForTest(*backend.value(), {&after, 1});
     LS_CHECK(second);
     LS_CHECK_EQ(
         first.value()[0].speakerId,
@@ -540,21 +571,18 @@ LS_TEST(acoustic_diarization_does_not_invent_a_speaker_without_embedding)
     LS_CHECK(backend);
     LS_CHECK(backend.value()->prepare(DiarizationConfiguration{}));
 
-    AudioWindow system;
-    system.sourceId = 2;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
 
     AsrHypothesis before;
     before.stableId[15] = 1;
     before.sourceId = 2;
     before.speakerTurnAfter = true;
-    auto first = backend.value()->assign(system, {&before, 1});
+    auto first = assignBatchForTest(*backend.value(), {&before, 1});
     LS_CHECK(first);
 
     AsrHypothesis after = before;
     after.stableId[15] = 2;
     after.speakerTurnAfter = false;
-    auto second = backend.value()->assign(system, {&after, 1});
+    auto second = assignBatchForTest(*backend.value(), {&after, 1});
     LS_CHECK(second);
     LS_CHECK_EQ(
         first.value()[0].speakerId,
@@ -567,9 +595,6 @@ LS_TEST(acoustic_diarization_keeps_a_real_explicit_voice_change)
     LS_CHECK(backend);
     LS_CHECK(backend.value()->prepare(DiarizationConfiguration{}));
 
-    AudioWindow system;
-    system.sourceId = 2;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
 
     AsrHypothesis before;
     before.stableId[15] = 1;
@@ -581,7 +606,7 @@ LS_TEST(acoustic_diarization_keeps_a_real_explicit_voice_change)
     before.speakerTurnAfter = true;
     before.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
     before.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
-    auto first = backend.value()->assign(system, {&before, 1});
+    auto first = assignBatchForTest(*backend.value(), {&before, 1});
     LS_CHECK(first);
 
     AsrHypothesis after = before;
@@ -591,10 +616,21 @@ LS_TEST(acoustic_diarization_keeps_a_real_explicit_voice_change)
     after.speakerTurnAfter = false;
     after.speakerEmbedding = speakerEmbeddingAtAngle(
         std::numbers::pi_v<float> / 2.0F);
-    auto second = backend.value()->assign(system, {&after, 1});
+    auto second = assignBatchForTest(*backend.value(), {&after, 1});
     LS_CHECK(second);
+    LS_CHECK_EQ(
+        first.value()[0].speakerId,
+        second.value()[0].speakerId);
+
+    auto confirmation = after;
+    confirmation.stableId[15] = 3;
+    confirmation.startTimeNs = 2'200'000'000;
+    confirmation.endTimeNs = 2'700'000'000;
+    const auto confirmed =
+        assignBatchForTest(*backend.value(), {&confirmation, 1});
+    LS_CHECK(confirmed);
     LS_CHECK(
-        first.value()[0].speakerId != second.value()[0].speakerId);
+        first.value()[0].speakerId != confirmed.value()[0].speakerId);
 }
 
 LS_TEST(acoustic_diarization_recognizes_a_persisted_voice_profile)
@@ -606,9 +642,6 @@ LS_TEST(acoustic_diarization_recognizes_a_persisted_voice_profile)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis hypothesis;
     hypothesis.stableId[15] = 1;
     hypothesis.sourceId = 22;
@@ -619,7 +652,7 @@ LS_TEST(acoustic_diarization_recognizes_a_persisted_voice_profile)
     hypothesis.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
     hypothesis.speakerEmbedding = speakerEmbeddingAtAngle(0.05F);
 
-    const auto turn = backend.value()->assign(system, {&hypothesis, 1});
+    const auto turn = assignBatchForTest(*backend.value(), {&hypothesis, 1});
     LS_CHECK(turn);
     LS_CHECK_EQ(turn.value()[0].speakerId, persistentSpeakerId(42));
     LS_CHECK_EQ(turn.value()[0].speakerLabel, std::string{"Alice"});
@@ -635,9 +668,6 @@ LS_TEST(acoustic_diarization_abstains_when_profiles_are_ambiguous)
         voiceProfile(8, "Bob", 0.10F)};
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis hypothesis;
     hypothesis.stableId[15] = 1;
     hypothesis.sourceId = 22;
@@ -646,7 +676,7 @@ LS_TEST(acoustic_diarization_abstains_when_profiles_are_ambiguous)
     hypothesis.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
     hypothesis.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
 
-    const auto turn = backend.value()->assign(system, {&hypothesis, 1});
+    const auto turn = assignBatchForTest(*backend.value(), {&hypothesis, 1});
     LS_CHECK(turn);
     LS_CHECK(!isPersistentSpeakerId(turn.value()[0].speakerId));
     LS_CHECK_EQ(turn.value()[0].speakerLabel, std::string{"Speaker 1"});
@@ -661,9 +691,6 @@ LS_TEST(acoustic_diarization_ignores_incompatible_profile_embeddings)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis hypothesis;
     hypothesis.stableId[15] = 1;
     hypothesis.sourceId = 22;
@@ -672,7 +699,7 @@ LS_TEST(acoustic_diarization_ignores_incompatible_profile_embeddings)
     hypothesis.speakerEmbeddingModel = "different-extractor-v1";
     hypothesis.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
 
-    const auto turn = backend.value()->assign(system, {&hypothesis, 1});
+    const auto turn = assignBatchForTest(*backend.value(), {&hypothesis, 1});
     LS_CHECK(turn);
     LS_CHECK(!isPersistentSpeakerId(turn.value()[0].speakerId));
     LS_CHECK_EQ(turn.value()[0].speakerLabel, std::string{"Speaker 1"});
@@ -687,9 +714,6 @@ LS_TEST(acoustic_diarization_does_not_adapt_persisted_profiles_implicitly)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -706,13 +730,18 @@ LS_TEST(acoustic_diarization_does_not_adapt_persisted_profiles_implicitly)
     };
     const auto nearAlice = hypothesis(1, 0.30F, 1'000'000'000);
     const auto driftingAway = hypothesis(2, 0.58F, 3'000'000'000);
+    const auto driftConfirmed = hypothesis(3, 0.59F, 3'600'000'000);
 
-    const auto first = backend.value()->assign(system, {&nearAlice, 1});
-    const auto second = backend.value()->assign(system, {&driftingAway, 1});
+    const auto first = assignBatchForTest(*backend.value(), {&nearAlice, 1});
+    const auto second = assignBatchForTest(*backend.value(), {&driftingAway, 1});
+    const auto confirmed =
+        assignBatchForTest(*backend.value(), {&driftConfirmed, 1});
     LS_CHECK(first);
     LS_CHECK(second);
+    LS_CHECK(confirmed);
     LS_CHECK_EQ(first.value()[0].speakerId, persistentSpeakerId(42));
-    LS_CHECK(!isPersistentSpeakerId(second.value()[0].speakerId));
+    LS_CHECK_EQ(second.value()[0].speakerId, persistentSpeakerId(42));
+    LS_CHECK(!isPersistentSpeakerId(confirmed.value()[0].speakerId));
 }
 
 LS_TEST(acoustic_diarization_prefers_a_stronger_session_cluster_to_a_profile)
@@ -724,9 +753,6 @@ LS_TEST(acoustic_diarization_prefers_a_stronger_session_cluster_to_a_profile)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -744,8 +770,8 @@ LS_TEST(acoustic_diarization_prefers_a_stronger_session_cluster_to_a_profile)
     const auto unknown = hypothesis(1, 0.40F, 1'000'000'000);
     const auto sameUnknown = hypothesis(2, 0.30F, 3'000'000'000);
 
-    const auto first = backend.value()->assign(system, {&unknown, 1});
-    const auto second = backend.value()->assign(system, {&sameUnknown, 1});
+    const auto first = assignBatchForTest(*backend.value(), {&unknown, 1});
+    const auto second = assignBatchForTest(*backend.value(), {&sameUnknown, 1});
     LS_CHECK(first);
     LS_CHECK(second);
     LS_CHECK(!isPersistentSpeakerId(first.value()[0].speakerId));
@@ -755,12 +781,12 @@ LS_TEST(acoustic_diarization_prefers_a_stronger_session_cluster_to_a_profile)
     revisedUnknown.revision = 2;
     revisedUnknown.speakerEmbedding = speakerEmbeddingAtAngle(0.20F);
     const auto revised =
-        backend.value()->assign(system, {&revisedUnknown, 1});
+        assignBatchForTest(*backend.value(), {&revisedUnknown, 1});
     LS_CHECK(revised);
     LS_CHECK_EQ(revised.value()[0].speakerId, first.value()[0].speakerId);
 }
 
-LS_TEST(acoustic_diarization_requires_voice_evidence_for_a_profile_label)
+LS_TEST(acoustic_diarization_does_not_switch_away_from_a_profile_without_voice_evidence)
 {
     auto backend = createDiarizationBackend("acoustic-clustering");
     LS_CHECK(backend);
@@ -769,9 +795,6 @@ LS_TEST(acoustic_diarization_requires_voice_evidence_for_a_profile_label)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto voiced = [](std::uint8_t id,
                            float angle,
                            std::int64_t startTimeNs) {
@@ -797,14 +820,14 @@ LS_TEST(acoustic_diarization_requires_voice_evidence_for_a_profile_label)
     noVoice.revision = 1;
     noVoice.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
 
-    const auto first = backend.value()->assign(system, {&unknown, 1});
-    const auto second = backend.value()->assign(system, {&alice, 1});
-    const auto third = backend.value()->assign(system, {&noVoice, 1});
+    const auto first = assignBatchForTest(*backend.value(), {&unknown, 1});
+    const auto second = assignBatchForTest(*backend.value(), {&alice, 1});
+    const auto third = assignBatchForTest(*backend.value(), {&noVoice, 1});
     LS_CHECK(first);
     LS_CHECK(second);
     LS_CHECK(third);
     LS_CHECK_EQ(second.value()[0].speakerId, persistentSpeakerId(42));
-    LS_CHECK(!isPersistentSpeakerId(third.value()[0].speakerId));
+    LS_CHECK_EQ(third.value()[0].speakerId, persistentSpeakerId(42));
 }
 
 LS_TEST(acoustic_diarization_reconsiders_profiles_on_better_revisions)
@@ -816,9 +839,6 @@ LS_TEST(acoustic_diarization_reconsiders_profiles_on_better_revisions)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis partial;
     partial.stableId[15] = 1;
     partial.sourceId = 22;
@@ -831,8 +851,8 @@ LS_TEST(acoustic_diarization_reconsiders_profiles_on_better_revisions)
     final.revision = 2;
     final.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
 
-    const auto provisional = backend.value()->assign(system, {&partial, 1});
-    const auto revised = backend.value()->assign(system, {&final, 1});
+    const auto provisional = assignBatchForTest(*backend.value(), {&partial, 1});
+    const auto revised = assignBatchForTest(*backend.value(), {&final, 1});
     LS_CHECK(provisional);
     LS_CHECK(revised);
     LS_CHECK(!isPersistentSpeakerId(provisional.value()[0].speakerId));
@@ -849,31 +869,33 @@ LS_TEST(acoustic_diarization_reconsiders_profiles_on_better_revisions)
     corrected.revision = 2;
     corrected.speakerEmbedding = speakerEmbeddingAtAngle(1.0F);
 
-    const auto matched = backend.value()->assign(system, {&earlyMatch, 1});
+    const auto matched = assignBatchForTest(*backend.value(), {&earlyMatch, 1});
     const auto correctedTurn =
-        backend.value()->assign(system, {&corrected, 1});
+        assignBatchForTest(*backend.value(), {&corrected, 1});
     LS_CHECK(matched);
     LS_CHECK(correctedTurn);
     LS_CHECK_EQ(matched.value()[0].speakerId, persistentSpeakerId(42));
-    LS_CHECK(!isPersistentSpeakerId(correctedTurn.value()[0].speakerId));
+    LS_CHECK_EQ(
+        correctedTurn.value()[0].speakerId,
+        persistentSpeakerId(42));
 
     auto duplicate = corrected;
     duplicate.speakerTurnAfter = true;
     const auto duplicateTurn =
-        backend.value()->assign(system, {&duplicate, 1});
+        assignBatchForTest(*backend.value(), {&duplicate, 1});
     LS_CHECK(duplicateTurn);
     LS_CHECK_EQ(
         duplicateTurn.value()[0].speakerId,
-        correctedTurn.value()[0].speakerId);
+        persistentSpeakerId(42));
 
     auto stale = earlyMatch;
     stale.final = true;
     stale.speakerTurnAfter = true;
-    const auto staleTurn = backend.value()->assign(system, {&stale, 1});
+    const auto staleTurn = assignBatchForTest(*backend.value(), {&stale, 1});
     LS_CHECK(staleTurn);
     LS_CHECK_EQ(
         staleTurn.value()[0].speakerId,
-        correctedTurn.value()[0].speakerId);
+        persistentSpeakerId(42));
 
     AsrHypothesis following = corrected;
     following.stableId[15] = 3;
@@ -881,11 +903,11 @@ LS_TEST(acoustic_diarization_reconsiders_profiles_on_better_revisions)
     following.startTimeNs = 5'000'000'000;
     following.endTimeNs = 5'500'000'000;
     const auto followingTurn =
-        backend.value()->assign(system, {&following, 1});
+        assignBatchForTest(*backend.value(), {&following, 1});
     LS_CHECK(followingTurn);
     LS_CHECK_EQ(
         followingTurn.value()[0].speakerId,
-        correctedTurn.value()[0].speakerId);
+        persistentSpeakerId(42));
 }
 
 LS_TEST(acoustic_diarization_keeps_embedding_models_isolated)
@@ -895,9 +917,6 @@ LS_TEST(acoustic_diarization_keeps_embedding_models_isolated)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                std::string model,
                                float angle,
@@ -917,17 +936,23 @@ LS_TEST(acoustic_diarization_keeps_embedding_models_isolated)
         hypothesis(1, "model-a", 0.0F, 1'000'000'000);
     const auto secondModel =
         hypothesis(2, "model-b", 0.0F, 3'000'000'000);
+    const auto secondModelConfirmed =
+        hypothesis(4, "model-b", 0.01F, 4'000'000'000);
     const auto firstModelAgain =
         hypothesis(3, "model-a", 0.01F, 5'000'000'000);
 
-    const auto first = backend.value()->assign(system, {&firstModel, 1});
-    const auto second = backend.value()->assign(system, {&secondModel, 1});
+    const auto first = assignBatchForTest(*backend.value(), {&firstModel, 1});
+    const auto second = assignBatchForTest(*backend.value(), {&secondModel, 1});
+    const auto confirmed =
+        assignBatchForTest(*backend.value(), {&secondModelConfirmed, 1});
     const auto third =
-        backend.value()->assign(system, {&firstModelAgain, 1});
+        assignBatchForTest(*backend.value(), {&firstModelAgain, 1});
     LS_CHECK(first);
     LS_CHECK(second);
+    LS_CHECK(confirmed);
     LS_CHECK(third);
-    LS_CHECK(first.value()[0].speakerId != second.value()[0].speakerId);
+    LS_CHECK_EQ(first.value()[0].speakerId, second.value()[0].speakerId);
+    LS_CHECK(first.value()[0].speakerId != confirmed.value()[0].speakerId);
     LS_CHECK_EQ(third.value()[0].speakerId, first.value()[0].speakerId);
 }
 
@@ -940,9 +965,6 @@ LS_TEST(acoustic_diarization_treats_non_finite_embeddings_as_missing)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis invalid;
     invalid.stableId[15] = 1;
     invalid.sourceId = 22;
@@ -955,7 +977,7 @@ LS_TEST(acoustic_diarization_treats_non_finite_embeddings_as_missing)
         std::numeric_limits<float>::quiet_NaN(),
         0.0F};
 
-    const auto turn = backend.value()->assign(system, {&invalid, 1});
+    const auto turn = assignBatchForTest(*backend.value(), {&invalid, 1});
     LS_CHECK(turn);
     LS_CHECK(!isPersistentSpeakerId(turn.value()[0].speakerId));
     LS_CHECK(std::isfinite(turn.value()[0].confidence));
@@ -970,9 +992,6 @@ LS_TEST(acoustic_diarization_does_not_let_profiles_bypass_novel_confirmation)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -989,13 +1008,13 @@ LS_TEST(acoustic_diarization_does_not_let_profiles_bypass_novel_confirmation)
     };
     const auto seed = hypothesis(1, 1.20F, 1'000'000'000);
     const auto novelFirst = hypothesis(2, 0.57F, 4'000'000'000);
-    const auto novelSecond = hypothesis(3, 0.18F, 5'000'000'000);
+    const auto novelSecond = hypothesis(3, 0.58F, 5'000'000'000);
 
-    const auto seedTurn = backend.value()->assign(system, {&seed, 1});
+    const auto seedTurn = assignBatchForTest(*backend.value(), {&seed, 1});
     const auto firstTurn =
-        backend.value()->assign(system, {&novelFirst, 1});
+        assignBatchForTest(*backend.value(), {&novelFirst, 1});
     const auto secondTurn =
-        backend.value()->assign(system, {&novelSecond, 1});
+        assignBatchForTest(*backend.value(), {&novelSecond, 1});
     LS_CHECK(seedTurn);
     LS_CHECK(firstTurn);
     LS_CHECK(secondTurn);
@@ -1013,9 +1032,6 @@ LS_TEST(acoustic_diarization_discards_pending_voice_at_an_explicit_turn)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     const auto hypothesis = [](std::uint8_t id,
                                float angle,
                                std::int64_t startTimeNs) {
@@ -1035,9 +1051,9 @@ LS_TEST(acoustic_diarization_discards_pending_voice_at_an_explicit_turn)
     beforeTurn.speakerTurnAfter = true;
     const auto alice = hypothesis(3, 0.317F, 5'000'000'000);
 
-    LS_CHECK(backend.value()->assign(system, {&seed, 1}));
-    LS_CHECK(backend.value()->assign(system, {&beforeTurn, 1}));
-    const auto afterTurn = backend.value()->assign(system, {&alice, 1});
+    LS_CHECK(assignBatchForTest(*backend.value(), {&seed, 1}));
+    LS_CHECK(assignBatchForTest(*backend.value(), {&beforeTurn, 1}));
+    const auto afterTurn = assignBatchForTest(*backend.value(), {&alice, 1});
     LS_CHECK(afterTurn);
     LS_CHECK_EQ(afterTurn.value()[0].speakerId, persistentSpeakerId(42));
 }
@@ -1051,9 +1067,6 @@ LS_TEST(acoustic_diarization_tracks_revision_cluster_evidence_ownership)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis independent;
     independent.stableId[15] = 1;
     independent.sourceId = 22;
@@ -1076,9 +1089,9 @@ LS_TEST(acoustic_diarization_tracks_revision_cluster_evidence_ownership)
     final.speakerEmbedding = speakerEmbeddingAtAngle(0.30F);
 
     const auto independentTurn =
-        backend.value()->assign(system, {&independent, 1});
-    const auto partialTurn = backend.value()->assign(system, {&partial, 1});
-    const auto finalTurn = backend.value()->assign(system, {&final, 1});
+        assignBatchForTest(*backend.value(), {&independent, 1});
+    const auto partialTurn = assignBatchForTest(*backend.value(), {&partial, 1});
+    const auto finalTurn = assignBatchForTest(*backend.value(), {&final, 1});
     LS_CHECK(independentTurn);
     LS_CHECK(partialTurn);
     LS_CHECK(finalTurn);
@@ -1099,9 +1112,6 @@ LS_TEST(acoustic_diarization_retires_unreferenced_revision_clusters)
         voiceProfile(42, "Alice", 0.0F));
     LS_CHECK(backend.value()->prepare(configuration));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis partial;
     partial.stableId[15] = 1;
     partial.sourceId = 22;
@@ -1111,6 +1121,7 @@ LS_TEST(acoustic_diarization_retires_unreferenced_revision_clusters)
     partial.speakerEmbeddingModel = std::string{kSpeakerFeatureModelId};
     partial.speakerEmbedding = speakerEmbeddingAtAngle(0.35F);
     AsrHypothesis final = partial;
+    final.endTimeNs = 1'900'000'000;
     final.final = true;
     final.revision = 2;
     final.speakerEmbedding = speakerEmbeddingAtAngle(0.0F);
@@ -1128,11 +1139,11 @@ LS_TEST(acoustic_diarization_retires_unreferenced_revision_clusters)
     alice.endTimeNs = 3'500'000'000;
     alice.speakerEmbedding = speakerEmbeddingAtAngle(0.20F);
 
-    const auto provisional = backend.value()->assign(system, {&partial, 1});
+    const auto provisional = assignBatchForTest(*backend.value(), {&partial, 1});
     const auto inherited =
-        backend.value()->assign(system, {&noEvidence, 1});
-    const auto revised = backend.value()->assign(system, {&final, 1});
-    const auto following = backend.value()->assign(system, {&alice, 1});
+        assignBatchForTest(*backend.value(), {&noEvidence, 1});
+    const auto revised = assignBatchForTest(*backend.value(), {&final, 1});
+    const auto following = assignBatchForTest(*backend.value(), {&alice, 1});
     LS_CHECK(provisional);
     LS_CHECK(inherited);
     LS_CHECK(revised);
@@ -1152,9 +1163,6 @@ LS_TEST(acoustic_diarization_reuses_empty_revision_placeholders)
     LS_CHECK(backend.value()->prepare(
         DiarizationConfiguration{11, 22, "Me", "Speaker 1"}));
 
-    AudioWindow system;
-    system.sourceId = 22;
-    system.sourceKind = LS_SOURCE_KIND_SYSTEM_AUDIO;
     AsrHypothesis partial;
     partial.stableId[15] = 1;
     partial.sourceId = 22;
@@ -1173,14 +1181,16 @@ LS_TEST(acoustic_diarization_reuses_empty_revision_placeholders)
     next.endTimeNs = 3'500'000'000;
     next.speakerEmbedding = speakerEmbeddingAtAngle(0.01F);
 
-    const auto provisional = backend.value()->assign(system, {&partial, 1});
-    const auto revised = backend.value()->assign(system, {&final, 1});
-    const auto following = backend.value()->assign(system, {&next, 1});
+    const auto provisional = assignBatchForTest(*backend.value(), {&partial, 1});
+    const auto revised = assignBatchForTest(*backend.value(), {&final, 1});
+    const auto following = assignBatchForTest(*backend.value(), {&next, 1});
     LS_CHECK(provisional);
     LS_CHECK(revised);
     LS_CHECK(following);
     LS_CHECK_EQ(revised.value()[0].speakerId, provisional.value()[0].speakerId);
-    LS_CHECK_EQ(following.value()[0].speakerId, provisional.value()[0].speakerId);
+    LS_CHECK(
+        following.value()[0].speakerId
+        != provisional.value()[0].speakerId);
 }
 
 LS_TEST(speaker_feature_extractor_distinguishes_spectral_envelopes)
@@ -1296,14 +1306,19 @@ LS_TEST(whisper_chunker_flushes_before_a_timeline_discontinuity)
     LS_CHECK(first.empty());
     auto boundary =
         chunker.accept(7, 9'000'000'000, after, true, false);
-    LS_CHECK_EQ(boundary.size(), std::size_t{1});
+    LS_CHECK_EQ(boundary.size(), std::size_t{2});
     LS_CHECK_EQ(boundary[0].startTimeNs, std::int64_t{1'000'000'000});
     LS_CHECK_EQ(boundary[0].samples.size(), before.size());
+    LS_CHECK(!boundary[0].discontinuityBefore);
+    LS_CHECK_EQ(boundary[1].startTimeNs, std::int64_t{9'000'000'000});
+    LS_CHECK(boundary[1].discontinuityBefore);
+    LS_CHECK(boundary[1].samples.empty());
 
     auto tail = chunker.flush();
     LS_CHECK_EQ(tail.size(), std::size_t{1});
     LS_CHECK_EQ(tail[0].startTimeNs, std::int64_t{9'000'000'000});
     LS_CHECK_EQ(tail[0].samples.size(), after.size());
+    LS_CHECK(!tail[0].discontinuityBefore);
     LS_CHECK(boundary[0].ordinal != tail[0].ordinal);
 }
 
@@ -1340,18 +1355,24 @@ LS_TEST(whisper_chunker_drops_only_short_backpressure_fragments)
 
     LS_CHECK(chunker.accept(
         1, 0, shortBefore, false, false).empty());
-    LS_CHECK(chunker.accept(
-        1, 1'000'000'000, after, true, false, true).empty());
+    const auto shortBoundary = chunker.accept(
+        1, 1'000'000'000, after, true, false, true);
+    LS_CHECK_EQ(shortBoundary.size(), std::size_t{1});
+    LS_CHECK(shortBoundary[0].discontinuityBefore);
+    LS_CHECK(shortBoundary[0].samples.empty());
     auto shortTail = chunker.flush();
     LS_CHECK_EQ(shortTail.size(), std::size_t{1});
     LS_CHECK_EQ(shortTail[0].samples.size(), after.size());
+    LS_CHECK(!shortTail[0].discontinuityBefore);
 
     LS_CHECK(chunker.accept(
         2, 0, meaningfulBefore, false, false).empty());
     auto boundary = chunker.accept(
         2, 2'000'000'000, after, true, false, true);
-    LS_CHECK_EQ(boundary.size(), std::size_t{1});
+    LS_CHECK_EQ(boundary.size(), std::size_t{2});
     LS_CHECK_EQ(boundary[0].samples.size(), meaningfulBefore.size());
+    LS_CHECK(boundary[1].discontinuityBefore);
+    LS_CHECK(boundary[1].samples.empty());
 }
 
 LS_TEST(local_speech_gate_preserves_context_and_rejects_clear_non_speech)

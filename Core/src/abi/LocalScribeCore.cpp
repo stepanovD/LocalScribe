@@ -318,8 +318,51 @@ public:
     ls_status_code_t pause()
     {
         std::lock_guard lifecycle(lifecycleMutex_);
+        {
+            std::lock_guard lock(stateMutex_);
+            if (closed_) {
+                return LS_CLOSED;
+            }
+            if (fatalError_.has_value()) {
+                return fatalError_->code;
+            }
+            if (stateMachine_.phase() != LS_PHASE_RECORDING) {
+                return LS_INVALID_STATE;
+            }
+            /* Park capture before draining without publishing paused yet. */
+            acceptingAudio_ = false;
+        }
+        waitUntilDrained();
         if (auto fatal = fatalErrorCopy(); fatal.has_value()) {
             return fatal->code;
+        }
+
+        auto flushed = flushAsrBounded();
+        if (flushed.timedOut) {
+            latchFatal(Error{
+                LS_TIMEOUT,
+                "ASR tail did not flush before pause"});
+        } else if (flushed.error.has_value()) {
+            latchFatal(std::move(*flushed.error));
+        } else {
+            for (auto &batch : flushed.batches) {
+                if (!processTimelineBatch(std::move(batch))) {
+                    break;
+                }
+            }
+        }
+
+        const bool diarizationFlushed =
+            flushDiarization(DiarizationFlushReason::pause);
+        const bool pendingFallbackPromoted =
+            fallbackPendingSpeakerGroups();
+        if (auto fatal = fatalErrorCopy(); fatal.has_value()) {
+            return fatal->code;
+        }
+        if (!diarizationFlushed || !pendingFallbackPromoted) {
+            return fatalErrorCopy().value_or(
+                Error{LS_BACKEND_FAILURE, "diarization pause flush failed"})
+                .code;
         }
         const auto status = persistTransition(
             LS_PHASE_RECORDING,
@@ -329,10 +372,6 @@ public:
             LS_EVENT_STATE_CHANGED);
         if (status != LS_OK) {
             return status;
-        }
-        waitUntilDrained();
-        if (auto fatal = fatalErrorCopy(); fatal.has_value()) {
-            return fatal->code;
         }
         auto recorded = recordLifecycleDiscontinuities("pause");
         return recorded ? LS_OK : recorded.error().code;
@@ -550,56 +589,80 @@ public:
     ls_status_code_t sourceEvent(SourceGap event)
     {
         std::lock_guard lifecycle(lifecycleMutex_);
-        {
-            std::lock_guard lock(stateMutex_);
-            if (closed_ || SessionStateMachine::isTerminal(
-                               stateMachine_.phase())) {
-                return closed_ ? LS_CLOSED : LS_INVALID_STATE;
-            }
-            if (fatalError_.has_value()) {
-                return fatalError_->code;
-            }
-            if (sourceKind(
-                    event.sourceId,
-                    record_.microphoneSourceId,
-                    record_.systemAudioSourceId)
-                == LS_SOURCE_KIND_UNKNOWN) {
-                return LS_INVALID_ARGUMENT;
-            }
+        std::unique_lock stateLock(stateMutex_);
+        if (closed_ || SessionStateMachine::isTerminal(
+                           stateMachine_.phase())) {
+            return closed_ ? LS_CLOSED : LS_INVALID_STATE;
+        }
+        if (fatalError_.has_value()) {
+            return fatalError_->code;
+        }
+        if (sourceKind(
+                event.sourceId,
+                record_.microphoneSourceId,
+                record_.systemAudioSourceId)
+            == LS_SOURCE_KIND_UNKNOWN) {
+            return LS_INVALID_ARGUMENT;
         }
 
+        /* Keep capture pushes on either side of the durable event boundary;
+           otherwise a concurrent post-gap frame could enter the queue first. */
         auto recorded =
             journal_->recordSourceEvent(record_.sessionId, event);
         if (!recorded) {
+            stateLock.unlock();
             latchFatal(recorded.error(), event.sourceId);
             return recorded.error().code;
         }
-        journalCheckpoint_.store(
-            recorded.value(),
-            std::memory_order_relaxed);
+        advanceJournalCheckpoint(recorded.value());
 
-        {
-            std::lock_guard lock(stateMutex_);
-            const bool required =
-                (event.sourceKind == LS_SOURCE_KIND_MICROPHONE
-                 && (record_.requiredSourceMask
-                     & LS_REQUIRED_SOURCE_MICROPHONE)
-                     != 0)
-                || (event.sourceKind == LS_SOURCE_KIND_SYSTEM_AUDIO
-                    && (record_.requiredSourceMask
-                        & LS_REQUIRED_SOURCE_SYSTEM_AUDIO)
-                        != 0);
-            const bool thresholdExceeded =
-                event.endTimeNs >= event.startTimeNs
-                && event.endTimeNs - event.startTimeNs
-                    > record_.completenessThresholdNs;
-            if (required
-                && (event.health == LS_SOURCE_HEALTH_PERMANENTLY_LOST
-                    || thresholdExceeded)) {
-                incompleteRequiredSource_ = true;
-            }
+        bool queuedInferenceBoundary = false;
+        const bool required =
+            (event.sourceKind == LS_SOURCE_KIND_MICROPHONE
+             && (record_.requiredSourceMask
+                 & LS_REQUIRED_SOURCE_MICROPHONE)
+                 != 0)
+            || (event.sourceKind == LS_SOURCE_KIND_SYSTEM_AUDIO
+                && (record_.requiredSourceMask
+                    & LS_REQUIRED_SOURCE_SYSTEM_AUDIO)
+                    != 0);
+        const bool thresholdExceeded =
+            event.endTimeNs >= event.startTimeNs
+            && event.endTimeNs - event.startTimeNs
+                > record_.completenessThresholdNs;
+        if (required
+            && (event.health == LS_SOURCE_HEALTH_PERMANENTLY_LOST
+                || thresholdExceeded)) {
+            incompleteRequiredSource_ = true;
         }
+
+        if (event.eventKind == LS_SOURCE_EVENT_DISCONTINUITY
+            && stateMachine_.phase() == LS_PHASE_RECORDING
+            && asr_ != nullptr && diarization_ != nullptr) {
+            AudioWindow boundary;
+            boundary.sourceId = event.sourceId;
+            boundary.sourceKind = sourceKind(
+                event.sourceId,
+                record_.microphoneSourceId,
+                record_.systemAudioSourceId);
+            boundary.monotonicTimeNs = event.endTimeNs;
+            boundary.sampleRateHz = 16'000;
+            boundary.channelCount = 1;
+            boundary.flags = LS_AUDIO_FLAG_DISCONTINUITY;
+            boundary.callbackCount = 0;
+            boundary.inferenceBoundaryOnly = true;
+            audioQueue_.push_back(std::move(boundary));
+            queueHighWater_ = std::max<std::uint32_t>(
+                queueHighWater_,
+                static_cast<std::uint32_t>(audioQueue_.size()));
+            queuedInferenceBoundary = true;
+        }
+        /* Keep the public Capture Event ahead of its inferred fallback. */
         enqueueSourceEvent(std::move(event));
+        stateLock.unlock();
+        if (queuedInferenceBoundary) {
+            workCondition_.notify_one();
+        }
         return LS_OK;
     }
 
@@ -611,6 +674,7 @@ public:
         }
         std::lock_guard lifecycle(lifecycleMutex_);
         ls_phase_t phase;
+        bool recoveryFinalization = false;
         {
             std::lock_guard lock(stateMutex_);
             phase = stateMachine_.phase();
@@ -623,8 +687,17 @@ public:
                 }
             } else if (
                 phase != LS_PHASE_RECORDING && phase != LS_PHASE_PAUSED
-                && phase != LS_PHASE_RECOVERY_REQUIRED) {
+                && phase != LS_PHASE_RECOVERY_REQUIRED
+                && phase != LS_PHASE_FINALIZING) {
                 return LS_INVALID_STATE;
+            }
+            recoveryFinalization = phase == LS_PHASE_RECOVERY_REQUIRED
+                || (phase == LS_PHASE_FINALIZING
+                    && record_.finalizeReason
+                        == LS_FINALIZE_REASON_RECOVERY);
+            if (phase == LS_PHASE_FINALIZING) {
+                /* Resume cleanup using the reason already made durable. */
+                reason = record_.finalizeReason;
             }
         }
         if (phase == LS_PHASE_PREPARING) {
@@ -635,14 +708,16 @@ public:
                 false,
                 LS_EVENT_TERMINAL);
         }
-        const auto toFinalizing = persistTransition(
-            phase,
-            LS_PHASE_FINALIZING,
-            reason,
-            false,
-            LS_EVENT_STATE_CHANGED);
-        if (toFinalizing != LS_OK) {
-            return toFinalizing;
+        if (phase != LS_PHASE_FINALIZING) {
+            const auto toFinalizing = persistTransition(
+                phase,
+                LS_PHASE_FINALIZING,
+                reason,
+                false,
+                LS_EVENT_STATE_CHANGED);
+            if (toFinalizing != LS_OK) {
+                return toFinalizing;
+            }
         }
         bool abandonedForDeadline = false;
         if (!waitUntilDrainedFor(std::chrono::seconds(2))) {
@@ -664,48 +739,46 @@ public:
             } else if (flushed.error.has_value()) {
                 latchFatal(std::move(*flushed.error));
             } else {
-                for (auto &hypothesis : flushed.hypotheses) {
-                    AudioWindow source;
-                    source.sourceId = hypothesis.sourceId;
-                    source.sourceKind = sourceKind(
-                        hypothesis.sourceId,
-                        record_.microphoneSourceId,
-                        record_.systemAudioSourceId);
-                    if (!processHypotheses(
-                            source,
-                            {std::move(hypothesis)})) {
+                for (auto &batch : flushed.batches) {
+                    if (!processTimelineBatch(std::move(batch))) {
                         break;
                     }
                 }
             }
         }
-        if (!abandonedForDeadline && !fatalErrorCopy().has_value()) {
-            try {
-                if (diarization_ != nullptr) {
-                    auto flushed = diarization_->flush();
-                    if (!flushed) {
-                        latchFatal(flushed.error());
-                    }
-                }
-            } catch (const std::exception &) {
-                latchFatal(
-                    Error{
-                        LS_INTERNAL_ERROR,
-                        "diarization flush raised an exception"});
-            } catch (...) {
-                latchFatal(
-                    Error{
-                        LS_INTERNAL_ERROR,
-                        "diarization flush raised an exception"});
+        if (fatalErrorCopy().has_value()) {
+            if (asr_ != nullptr) {
+                asr_->requestAbort();
             }
+        }
+
+        /*
+         * A pending speaker decision already owns durable final text. Resolve
+         * it even when ASR tail processing was abandoned, but never race an
+         * assign still unwinding in the inference worker.
+         */
+        if (waitForDiarizationIdleFor(std::chrono::seconds(1))) {
+            (void)flushDiarization(DiarizationFlushReason::endOfStream);
+        } else {
+            latchFatal(Error{
+                LS_TIMEOUT,
+                "diarization did not become idle before finalization"});
+        }
+
+        if (!fallbackPendingSpeakerGroups()) {
+            return fatalErrorCopy().value_or(
+                Error{
+                    LS_RECOVERY_ERROR,
+                    "pending speaker fallback promotion failed"})
+                .code;
         }
 
         if (fatalErrorCopy().has_value()) {
             reason = LS_FINALIZE_REASON_PROCESS_INTERRUPTED;
             /*
-             * A fatal latch asks the idle worker to exit. Waiting for the
-             * explicit exit acknowledgement prevents backend destruction or
-             * terminal publication racing a worker that is unwinding.
+             * A fatal latch asks the worker to exit. Waiting for its explicit
+             * acknowledgement prevents backend destruction or terminal
+             * publication racing an inference call that is unwinding.
              */
             if (asr_ != nullptr) {
                 asr_->requestAbort();
@@ -714,7 +787,7 @@ public:
         }
 
         ls_phase_t terminal = LS_PHASE_COMPLETE;
-        if (phase == LS_PHASE_RECOVERY_REQUIRED
+        if (recoveryFinalization
             || reason == LS_FINALIZE_REASON_RECOVERY
             || reason == LS_FINALIZE_REASON_CANCELLED
             || reason == LS_FINALIZE_REASON_PROCESS_INTERRUPTED) {
@@ -883,11 +956,11 @@ private:
     struct AsrFlushSharedState {
         std::mutex mutex;
         std::condition_variable condition;
-        std::optional<Expected<std::vector<AsrHypothesis>>> result;
+        std::optional<Expected<std::vector<AsrTimelineBatch>>> result;
     };
 
     struct AsrFlushOutcome {
-        std::vector<AsrHypothesis> hypotheses;
+        std::vector<AsrTimelineBatch> batches;
         std::optional<Error> error;
         bool timedOut{};
     };
@@ -998,6 +1071,18 @@ private:
         return fatalError_.has_value();
     }
 
+    void advanceJournalCheckpoint(std::uint64_t checkpoint) noexcept
+    {
+        auto observed = journalCheckpoint_.load(std::memory_order_relaxed);
+        while (observed < checkpoint
+               && !journalCheckpoint_.compare_exchange_weak(
+                   observed,
+                   checkpoint,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
     /*
      * First fatal data-path failure wins. Frames still waiting in the queue
      * are reclassified as rejected, and their durable counters are updated
@@ -1026,6 +1111,7 @@ private:
             firstFailure = true;
             acceptingAudio_ = false;
             stopWorker_ = true;
+            discardProcessingResults_ = true;
             failureTimeNs = latestMonotonicTimeNs_;
             absorbAtomicBackpressureLocked(record_.microphoneSourceId);
             absorbAtomicBackpressureLocked(record_.systemAudioSourceId);
@@ -1149,9 +1235,7 @@ private:
                         record_.sessionId,
                         gap);
                     if (checkpoint) {
-                        journalCheckpoint_.store(
-                            checkpoint.value(),
-                            std::memory_order_relaxed);
+                        advanceJournalCheckpoint(checkpoint.value());
                         enqueueSourceEvent(std::move(gap));
                     }
                 } catch (...) {
@@ -1206,78 +1290,85 @@ private:
                             ? queuedSamples - window.samples.size()
                             : 0;
                         processing_ = true;
-                        ProcessingWindowInfo info;
-                        info.sourceId = window.sourceId;
-                        info.sourceKind = window.sourceKind;
-                        info.callbackCount = window.callbackCount;
-                        info.startTimeNs = window.monotonicTimeNs;
-                        const auto durationNs =
-                            window.sampleRateHz == 0
-                            ? 0
-                            : static_cast<std::int64_t>(
-                                  static_cast<long double>(window.frameCount)
-                                  * 1'000'000'000.0L
-                                  / window.sampleRateHz);
-                        info.endTimeNs = window.monotonicTimeNs + durationNs;
-                        processingWindow_ = info;
+                        if (!window.inferenceBoundaryOnly) {
+                            ProcessingWindowInfo info;
+                            info.sourceId = window.sourceId;
+                            info.sourceKind = window.sourceKind;
+                            info.callbackCount = window.callbackCount;
+                            info.startTimeNs = window.monotonicTimeNs;
+                            const auto durationNs =
+                                window.sampleRateHz == 0
+                                ? 0
+                                : static_cast<std::int64_t>(
+                                      static_cast<long double>(
+                                          window.frameCount)
+                                      * 1'000'000'000.0L
+                                      / window.sampleRateHz);
+                            info.endTimeNs =
+                                window.monotonicTimeNs + durationNs;
+                            processingWindow_ = info;
+                        } else {
+                            processingWindow_.reset();
+                        }
                         hasWindow = true;
                     }
                 }
 
                 if (hasWindow) {
-                    auto accepted = journal_->recordFramesAccepted(
-                        record_.sessionId,
-                        window.sourceId,
-                        window.callbackCount);
-                    if (!accepted) {
-                        latchFatal(
-                            accepted.error(),
-                            window.sourceId,
-                            window.sourceId);
-                        failed = true;
-                    }
-
-                    if (!failed && window.rejectedCallbacksBefore != 0) {
-                        auto recorded = journal_->recordFramesRejected(
+                    if (!window.inferenceBoundaryOnly) {
+                        auto accepted = journal_->recordFramesAccepted(
                             record_.sessionId,
                             window.sourceId,
-                            window.rejectedCallbacksBefore,
-                            false);
-                        if (!recorded) {
-                            latchFatal(recorded.error(), window.sourceId);
-                            failed = true;
-                        }
-                    }
-
-                    if (!failed
-                        && (window.flags & LS_AUDIO_FLAG_DISCONTINUITY) != 0) {
-                        SourceGap gap;
-                        gap.sourceId = window.sourceId;
-                        gap.sourceKind = window.sourceKind;
-                        gap.eventKind = LS_SOURCE_EVENT_DISCONTINUITY;
-                        gap.health = LS_SOURCE_HEALTH_ACTIVE;
-                        gap.startTimeNs = window.overloadGapBefore
-                            ? window.overloadGapStartTimeNs
-                            : window.monotonicTimeNs;
-                        gap.endTimeNs = window.overloadGapBefore
-                            ? window.overloadGapEndTimeNs
-                            : window.monotonicTimeNs;
-                        gap.reason = window.overloadGapBefore
-                            ? "backpressure overload episode"
-                            : "audio sequence discontinuity";
-                        auto checkpoint = journal_->recordSourceEvent(
-                            record_.sessionId,
-                            gap);
-                        if (checkpoint) {
-                            journalCheckpoint_.store(
-                                checkpoint.value(),
-                                std::memory_order_relaxed);
-                            enqueueSourceEvent(std::move(gap));
-                        } else {
+                            window.callbackCount);
+                        if (!accepted) {
                             latchFatal(
-                                checkpoint.error(),
+                                accepted.error(),
+                                window.sourceId,
                                 window.sourceId);
                             failed = true;
+                        }
+
+                        if (!failed && window.rejectedCallbacksBefore != 0) {
+                            auto recorded = journal_->recordFramesRejected(
+                                record_.sessionId,
+                                window.sourceId,
+                                window.rejectedCallbacksBefore,
+                                false);
+                            if (!recorded) {
+                                latchFatal(recorded.error(), window.sourceId);
+                                failed = true;
+                            }
+                        }
+
+                        if (!failed
+                            && (window.flags & LS_AUDIO_FLAG_DISCONTINUITY)
+                                != 0) {
+                            SourceGap gap;
+                            gap.sourceId = window.sourceId;
+                            gap.sourceKind = window.sourceKind;
+                            gap.eventKind = LS_SOURCE_EVENT_DISCONTINUITY;
+                            gap.health = LS_SOURCE_HEALTH_ACTIVE;
+                            gap.startTimeNs = window.overloadGapBefore
+                                ? window.overloadGapStartTimeNs
+                                : window.monotonicTimeNs;
+                            gap.endTimeNs = window.overloadGapBefore
+                                ? window.overloadGapEndTimeNs
+                                : window.monotonicTimeNs;
+                            gap.reason = window.overloadGapBefore
+                                ? "backpressure overload episode"
+                                : "audio sequence discontinuity";
+                            auto checkpoint = journal_->recordSourceEvent(
+                                record_.sessionId,
+                                gap);
+                            if (checkpoint) {
+                                advanceJournalCheckpoint(checkpoint.value());
+                                enqueueSourceEvent(std::move(gap));
+                            } else {
+                                latchFatal(
+                                    checkpoint.error(),
+                                    window.sourceId);
+                                failed = true;
+                            }
                         }
                     }
                     if (!failed) {
@@ -1321,12 +1412,12 @@ private:
         if (asr_ == nullptr || diarization_ == nullptr) {
             return true;
         }
-        auto hypotheses = asr_->accept(window);
-        if (!hypotheses) {
+        auto batches = asr_->accept(window);
+        if (!batches) {
             if (shouldDiscardProcessing()) {
                 return true;
             }
-            latchFatal(hypotheses.error(), window.sourceId);
+            latchFatal(batches.error(), window.sourceId);
             return false;
         }
         if (shouldDiscardProcessing()) {
@@ -1335,9 +1426,37 @@ private:
         if (hasFatalError()) {
             return false;
         }
-        return processHypotheses(
-            window,
-            std::move(hypotheses.value()));
+        bool deliveredCurrentDiscontinuity = false;
+        for (auto &batch : batches.value()) {
+            if (batch.sourceId != window.sourceId) {
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "ASR accept returned a batch for a different source"},
+                    window.sourceId);
+                return false;
+            }
+            deliveredCurrentDiscontinuity =
+                deliveredCurrentDiscontinuity
+                || (batch.discontinuityBefore
+                    && batch.processedStartTimeNs
+                        == window.monotonicTimeNs);
+            if (!processTimelineBatch(std::move(batch), true)) {
+                return false;
+            }
+        }
+        if ((window.flags & LS_AUDIO_FLAG_DISCONTINUITY) != 0
+            && !deliveredCurrentDiscontinuity) {
+            AsrTimelineBatch boundary;
+            boundary.sourceId = window.sourceId;
+            boundary.processedStartTimeNs = window.monotonicTimeNs;
+            boundary.finalizedThroughTimeNs = window.monotonicTimeNs;
+            boundary.discontinuityBefore = true;
+            if (!processTimelineBatch(std::move(boundary), true)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     [[nodiscard]] bool shouldDiscardProcessing() const
@@ -1346,149 +1465,454 @@ private:
         return discardProcessingResults_;
     }
 
-    [[nodiscard]] bool processHypotheses(
-        const AudioWindow &window,
-        std::vector<AsrHypothesis> hypotheses)
+    [[nodiscard]] Expected<TranscriptSegment> makeTranscriptSegment(
+        const AsrHypothesis &hypothesis,
+        const SpeakerTurn &turn)
     {
-        if (hypotheses.empty()) {
+        if (turn.stableId != hypothesis.stableId
+            || turn.revision != hypothesis.revision
+            || turn.sourceId != hypothesis.sourceId) {
+            return Error{
+                LS_BACKEND_FAILURE,
+                "diarization decision does not match its ASR hypothesis"};
+        }
+
+        TranscriptSegment segment;
+        segment.stableId = hypothesis.stableId;
+        segment.sourceId = hypothesis.sourceId;
+        segment.startTimeNs = hypothesis.startTimeNs;
+        segment.endTimeNs = hypothesis.endTimeNs;
+        const auto segmentSourceKind = sourceKind(
+            hypothesis.sourceId,
+            record_.microphoneSourceId,
+            record_.systemAudioSourceId);
+        if (segmentSourceKind == LS_SOURCE_KIND_MICROPHONE) {
+            /* Source ownership is authoritative over acoustic suggestions. */
+            segment.speakerId = 1;
+            segment.speakerLabel = record_.localSpeakerName;
+        } else if (segmentSourceKind == LS_SOURCE_KIND_SYSTEM_AUDIO) {
+            segment.speakerId =
+                turn.speakerId == 1
+                ? (kAnonymousSpeakerFlag | hypothesis.sourceId)
+                : turn.speakerId;
+            segment.speakerLabel =
+                turn.speakerLabel.empty()
+                    || turn.speakerLabel == record_.localSpeakerName
+                ? (record_.localSpeakerName == "Speaker 1"
+                       ? "Remote Speaker 1"
+                       : "Speaker 1")
+                : turn.speakerLabel;
+            segment.speakerEmbeddingModel =
+                hypothesis.speakerEmbeddingModel;
+            segment.speakerEmbedding = hypothesis.speakerEmbedding;
+        } else {
+            return Error{
+                LS_BACKEND_FAILURE,
+                "ASR produced a final for an unknown source"};
+        }
+
+        segment.text = hypothesis.text;
+        const auto previousLanguage =
+            lastLanguageBySource_.find(hypothesis.sourceId);
+        segment.language = TranscriptLanguagePolicy::select(
+            record_.languageMode,
+            segment.text,
+            hypothesis.language,
+            previousLanguage == lastLanguageBySource_.end()
+                ? std::string_view{}
+                : std::string_view(previousLanguage->second));
+        lastLanguageBySource_[hypothesis.sourceId] = segment.language;
+        segment.confidence = std::clamp(
+            hypothesis.confidence * turn.confidence,
+            0.0F,
+            1.0F);
+        segment.revision = hypothesis.revision;
+        segment.flags = LS_SEGMENT_FLAG_FINAL
+            | (hypothesis.unintelligible
+                   ? LS_SEGMENT_FLAG_UNINTELLIGIBLE
+                   : 0u);
+        return segment;
+    }
+
+    [[nodiscard]] bool applyDiarizationUpdate(
+        std::span<const AsrHypothesis> hypotheses,
+        DiarizationUpdate update,
+        std::uint64_t failureSourceId = 0,
+        bool discardIfProcessingWasCancelled = false)
+    {
+        std::lock_guard resultCommit(resultCommitMutex_);
+        if (discardIfProcessingWasCancelled && shouldDiscardProcessing()) {
             return true;
         }
-        if (diarization_ == nullptr) {
+        if (update.decisions.size() != hypotheses.size()) {
             latchFatal(
                 Error{
-                    LS_BACKEND_UNAVAILABLE,
-                    "diarization unavailable"},
-                window.sourceId);
+                    LS_BACKEND_FAILURE,
+                    "diarization returned the wrong decision count"},
+                failureSourceId);
             return false;
         }
-        if (hasFatalError()) {
-            return false;
-        }
-        auto turns = diarization_->assign(window, hypotheses);
-        if (!turns) {
-            latchFatal(turns.error(), window.sourceId);
-            return false;
-        }
-        if (hasFatalError()) {
-            return false;
-        }
-        for (const auto &hypothesis : hypotheses) {
-            if (hasFatalError()) {
+
+        DiarizationJournalBatch journalBatch;
+        for (std::size_t index = 0; index < hypotheses.size(); ++index) {
+            const auto &hypothesis = hypotheses[index];
+            const auto &decision = update.decisions[index];
+            if (decision.turn.stableId != hypothesis.stableId
+                || decision.turn.revision != hypothesis.revision
+                || decision.turn.sourceId != hypothesis.sourceId) {
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "diarization decision order or identity is invalid"},
+                    hypothesis.sourceId);
+                return false;
+            }
+            switch (decision.kind) {
+            case SpeakerTurnDecisionKind::commit:
+                if (decision.pendingGroupId != 0
+                    || decision.deadlineTimeNs != 0) {
+                    latchFatal(
+                        Error{
+                            LS_BACKEND_FAILURE,
+                            "committed diarization decision has pending metadata"},
+                        hypothesis.sourceId);
+                    return false;
+                }
+                break;
+            case SpeakerTurnDecisionKind::hold:
+                break;
+            default:
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "diarization returned an unknown decision kind"},
+                    hypothesis.sourceId);
                 return false;
             }
             if (!hypothesis.final) {
+                if (decision.kind != SpeakerTurnDecisionKind::commit) {
+                    latchFatal(
+                        Error{
+                            LS_BACKEND_FAILURE,
+                            "diarization attempted to hold a partial hypothesis"},
+                        hypothesis.sourceId);
+                    return false;
+                }
                 partialEventsCoalesced_.fetch_add(
                     1,
                     std::memory_order_relaxed);
                 continue;
             }
-            const auto turn = std::find_if(
-                turns.value().begin(),
-                turns.value().end(),
-                [&](const SpeakerTurn &candidate) {
-                    return candidate.stableId == hypothesis.stableId
-                        && candidate.revision == hypothesis.revision;
+
+            auto segment = makeTranscriptSegment(
+                hypothesis,
+                decision.turn);
+            if (!segment) {
+                latchFatal(
+                    segment.error(),
+                    hypothesis.sourceId);
+                return false;
+            }
+
+            if (decision.kind == SpeakerTurnDecisionKind::commit) {
+                journalBatch.commits.push_back(segment.takeValue());
+                continue;
+            }
+            if (hypothesis.sourceId != record_.systemAudioSourceId) {
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "diarization attempted to hold a non-system source"},
+                    hypothesis.sourceId);
+                return false;
+            }
+            if (decision.pendingGroupId == 0
+                || decision.deadlineTimeNs < hypothesis.endTimeNs) {
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "diarization returned an invalid pending group"},
+                    hypothesis.sourceId);
+                return false;
+            }
+
+            auto stage = std::find_if(
+                journalBatch.holds.begin(),
+                journalBatch.holds.end(),
+                [&](const PendingSpeakerGroupStage &candidate) {
+                    return candidate.groupId == decision.pendingGroupId;
                 });
-            if (turn == turns.value().end()) {
-                latchFatal(
-                    Error{
-                        LS_BACKEND_FAILURE,
-                        "diarization omitted a final hypothesis"},
-                    hypothesis.sourceId);
-                return false;
-            }
-            TranscriptSegment segment;
-            segment.stableId = hypothesis.stableId;
-            segment.sourceId = hypothesis.sourceId;
-            segment.startTimeNs = hypothesis.startTimeNs;
-            segment.endTimeNs = hypothesis.endTimeNs;
-            const auto segmentSourceKind = sourceKind(
-                hypothesis.sourceId,
-                record_.microphoneSourceId,
-                record_.systemAudioSourceId);
-            if (segmentSourceKind == LS_SOURCE_KIND_MICROPHONE) {
-                /*
-                 * Source ownership is a product invariant, not a clustering
-                 * suggestion: all microphone speech belongs to the configured
-                 * local participant.
-                 */
-                segment.speakerId = 1;
-                segment.speakerLabel = record_.localSpeakerName;
-            } else if (
-                segmentSourceKind == LS_SOURCE_KIND_SYSTEM_AUDIO) {
-                /*
-                 * Reserve speaker ID 1 and the local label for microphone
-                 * audio even if a future diarization backend misbehaves.
-                 */
-                segment.speakerId =
-                    turn->speakerId == 1
-                    ? (0x8000000000000000ULL | hypothesis.sourceId)
-                    : turn->speakerId;
-                segment.speakerLabel =
-                    turn->speakerLabel.empty()
-                        || turn->speakerLabel
-                            == record_.localSpeakerName
-                    ? (record_.localSpeakerName == "Speaker 1"
-                           ? "Remote Speaker 1"
-                           : "Speaker 1")
-                    : turn->speakerLabel;
-                segment.speakerEmbeddingModel =
-                    hypothesis.speakerEmbeddingModel;
-                segment.speakerEmbedding = hypothesis.speakerEmbedding;
+            if (stage == journalBatch.holds.end()) {
+                PendingSpeakerGroupStage created;
+                created.groupId = decision.pendingGroupId;
+                created.deadlineMonotonicNs = decision.deadlineTimeNs;
+                created.fallbackSegments.push_back(segment.takeValue());
+                journalBatch.holds.push_back(std::move(created));
             } else {
+                if (stage->deadlineMonotonicNs != decision.deadlineTimeNs) {
+                    latchFatal(
+                        Error{
+                            LS_BACKEND_FAILURE,
+                            "pending group deadline changed"},
+                        hypothesis.sourceId);
+                    return false;
+                }
+                stage->fallbackSegments.push_back(segment.takeValue());
+            }
+        }
+
+        journalBatch.resolutions.reserve(update.resolutions.size());
+        for (auto &resolution : update.resolutions) {
+            if (resolution.pendingGroupId == 0) {
                 latchFatal(
                     Error{
                         LS_BACKEND_FAILURE,
-                        "ASR produced a final for an unknown source"},
-                    hypothesis.sourceId);
+                        "diarization resolved an invalid pending group"},
+                    failureSourceId);
                 return false;
             }
-            segment.text = hypothesis.text;
-            const auto previousLanguage =
-                lastLanguageBySource_.find(hypothesis.sourceId);
-            segment.language = TranscriptLanguagePolicy::select(
-                record_.languageMode,
-                segment.text,
-                hypothesis.language,
-                previousLanguage == lastLanguageBySource_.end()
-                    ? std::string_view{}
-                    : std::string_view(previousLanguage->second));
-            lastLanguageBySource_[hypothesis.sourceId] =
-                segment.language;
-            segment.confidence =
-                std::clamp(
-                    hypothesis.confidence * turn->confidence,
-                    0.0F,
-                    1.0F);
-            segment.revision = hypothesis.revision;
-            segment.flags = LS_SEGMENT_FLAG_FINAL
-                | (hypothesis.unintelligible
-                       ? LS_SEGMENT_FLAG_UNINTELLIGIBLE
-                       : 0u);
-            auto committed = journal_->appendFinalSegment(
-                record_.sessionId,
-                segment);
-            if (!committed) {
-                latchFatal(committed.error(), segment.sourceId);
+            PendingSpeakerGroupResolution journalResolution;
+            journalResolution.groupId = resolution.pendingGroupId;
+            switch (resolution.reason) {
+            case PendingSpeakerResolutionReason::confirmed:
+                if (resolution.turns.empty()) {
+                    latchFatal(
+                        Error{
+                            LS_BACKEND_FAILURE,
+                            "confirmed speaker resolution has no attributions"},
+                        failureSourceId);
+                    return false;
+                }
+                journalResolution.attributions.reserve(
+                    resolution.turns.size());
+                for (auto &turn : resolution.turns) {
+                    if (turn.sourceId != record_.systemAudioSourceId) {
+                        latchFatal(
+                            Error{
+                                LS_BACKEND_FAILURE,
+                                "confirmed speaker resolution changed source ownership"},
+                            turn.sourceId);
+                        return false;
+                    }
+                    if (turn.speakerId == 1) {
+                        turn.speakerId =
+                            kAnonymousSpeakerFlag | turn.sourceId;
+                    }
+                    if (turn.speakerLabel.empty()
+                        || turn.speakerLabel == record_.localSpeakerName) {
+                        turn.speakerLabel =
+                            record_.localSpeakerName == "Speaker 1"
+                            ? "Remote Speaker 1"
+                            : "Speaker 1";
+                    }
+                    journalResolution.attributions.push_back(
+                        std::move(turn));
+                }
+                break;
+            case PendingSpeakerResolutionReason::contradicted:
+            case PendingSpeakerResolutionReason::timeout:
+            case PendingSpeakerResolutionReason::discontinuity:
+            case PendingSpeakerResolutionReason::pause:
+            case PendingSpeakerResolutionReason::endOfStream:
+            case PendingSpeakerResolutionReason::capacity:
+                /* The durable fallback is authoritative for every rejection. */
+                break;
+            default:
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "diarization returned an unknown resolution reason"},
+                    failureSourceId);
                 return false;
             }
-            segment.journalCheckpoint = committed.value();
-            journalCheckpoint_.store(
-                committed.value(),
-                std::memory_order_relaxed);
-            auto observed =
-                highestSegmentRevision_.load(std::memory_order_relaxed);
-            while (observed < segment.revision
-                   && !highestSegmentRevision_.compare_exchange_weak(
-                       observed,
-                       segment.revision,
-                       std::memory_order_relaxed,
-                       std::memory_order_relaxed)) {
+            journalBatch.resolutions.push_back(
+                std::move(journalResolution));
+        }
+
+        if (journalBatch.commits.empty() && journalBatch.holds.empty()
+            && journalBatch.resolutions.empty()) {
+            return true;
+        }
+
+        auto applied = journal_->applyDiarizationBatch(
+            record_.sessionId,
+            journalBatch);
+        if (!applied) {
+            latchFatal(applied.error(), failureSourceId);
+            return false;
+        }
+
+        consumeDiarizationJournalResult(applied.value());
+        return true;
+    }
+
+    void consumeDiarizationJournalResult(
+        DiarizationJournalBatchResult &result)
+    {
+        if (result.journalCheckpoint != 0) {
+            advanceJournalCheckpoint(result.journalCheckpoint);
+        }
+        auto observed =
+            highestSegmentRevision_.load(std::memory_order_relaxed);
+        while (observed < result.highestSegmentRevision
+               && !highestSegmentRevision_.compare_exchange_weak(
+                   observed,
+                   result.highestSegmentRevision,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+
+        auto &visible = result.visibleSegments;
+        std::stable_sort(
+            visible.begin(),
+            visible.end(),
+            [](const TranscriptSegment &left,
+               const TranscriptSegment &right) {
+                if (left.startTimeNs != right.startTimeNs) {
+                    return left.startTimeNs < right.startTimeNs;
+                }
+                if (left.endTimeNs != right.endTimeNs) {
+                    return left.endTimeNs < right.endTimeNs;
+                }
+                if (left.sourceId != right.sourceId) {
+                    return left.sourceId < right.sourceId;
+                }
+                if (left.stableId != right.stableId) {
+                    return left.stableId < right.stableId;
+                }
+                return left.revision < right.revision;
+            });
+        finalSegments_.fetch_add(
+            visible.size(),
+            std::memory_order_relaxed);
+        for (auto &segment : visible) {
+            if (segment.journalCheckpoint == 0) {
+                segment.journalCheckpoint =
+                    result.journalCheckpoint;
             }
-            finalSegments_.fetch_add(1, std::memory_order_relaxed);
             enqueueSegmentEvent(std::move(segment));
         }
-        return true;
+    }
+
+    [[nodiscard]] bool processTimelineBatch(
+        AsrTimelineBatch batch,
+        bool discardIfProcessingWasCancelled = false)
+    {
+        if (diarization_ == nullptr) {
+            latchFatal(
+                Error{LS_BACKEND_UNAVAILABLE, "diarization unavailable"},
+                batch.sourceId);
+            return false;
+        }
+        if (sourceKind(
+                batch.sourceId,
+                record_.microphoneSourceId,
+                record_.systemAudioSourceId)
+                == LS_SOURCE_KIND_UNKNOWN
+            || batch.processedStartTimeNs < 0
+            || batch.finalizedThroughTimeNs < batch.processedStartTimeNs) {
+            latchFatal(
+                Error{
+                    LS_BACKEND_FAILURE,
+                    "ASR timeline batch has invalid source or bounds"},
+                batch.sourceId);
+            return false;
+        }
+        for (const auto &hypothesis : batch.hypotheses) {
+            if (hypothesis.sourceId != batch.sourceId
+                || hypothesis.startTimeNs < batch.processedStartTimeNs
+                || hypothesis.endTimeNs < hypothesis.startTimeNs
+                || hypothesis.endTimeNs > batch.finalizedThroughTimeNs) {
+                latchFatal(
+                    Error{
+                        LS_BACKEND_FAILURE,
+                        "ASR hypothesis falls outside its processed timeline batch"},
+                    batch.sourceId);
+                return false;
+            }
+        }
+
+        Expected<DiarizationUpdate> update = Error{
+            LS_INTERNAL_ERROR,
+            "diarization assignment did not run"};
+        try {
+            update = diarization_->assign(batch);
+        } catch (const std::exception &) {
+            latchFatal(
+                Error{
+                    LS_INTERNAL_ERROR,
+                    "diarization assignment raised an exception"},
+                batch.sourceId);
+            return false;
+        } catch (...) {
+            latchFatal(
+                Error{
+                    LS_INTERNAL_ERROR,
+                    "diarization assignment raised an exception"},
+                batch.sourceId);
+            return false;
+        }
+        if (!update) {
+            latchFatal(update.error(), batch.sourceId);
+            return false;
+        }
+        const bool applied = applyDiarizationUpdate(
+            batch.hypotheses,
+            update.takeValue(),
+            batch.sourceId,
+            discardIfProcessingWasCancelled);
+        return applied;
+    }
+
+    [[nodiscard]] bool flushDiarization(DiarizationFlushReason reason)
+    {
+        if (diarization_ == nullptr) {
+            return true;
+        }
+        try {
+            auto update = diarization_->flush(reason);
+            if (!update) {
+                latchFatal(update.error());
+                return false;
+            }
+            return applyDiarizationUpdate({}, update.takeValue());
+        } catch (const std::exception &) {
+            latchFatal(
+                Error{
+                    LS_INTERNAL_ERROR,
+                    "diarization flush raised an exception"});
+        } catch (...) {
+            latchFatal(
+                Error{
+                    LS_INTERNAL_ERROR,
+                    "diarization flush raised an exception"});
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool fallbackPendingSpeakerGroups()
+    {
+        std::lock_guard resultCommit(resultCommitMutex_);
+        try {
+            auto resolved =
+                journal_->resolveAllPendingSpeakerGroupsToFallback(
+                    record_.sessionId);
+            if (!resolved) {
+                latchFatal(resolved.error());
+                return false;
+            }
+            consumeDiarizationJournalResult(resolved.value());
+            return true;
+        } catch (const std::exception &) {
+            latchFatal(Error{
+                LS_INTERNAL_ERROR,
+                "pending speaker fallback promotion raised an exception"});
+        } catch (...) {
+            latchFatal(Error{
+                LS_INTERNAL_ERROR,
+                "pending speaker fallback promotion raised an exception"});
+        }
+        return false;
     }
 
     ls_status_code_t persistTransition(
@@ -1527,9 +1951,7 @@ private:
         record_.phase = next;
         record_.finalizeReason = reason;
         record_.journalCheckpoint = checkpoint.value();
-        journalCheckpoint_.store(
-            checkpoint.value(),
-            std::memory_order_relaxed);
+        advanceJournalCheckpoint(checkpoint.value());
         acceptingAudio_ = accepting;
         lock.unlock();
         enqueueStateEvent(eventKind, next, reason);
@@ -1560,6 +1982,16 @@ private:
         });
     }
 
+    template <typename Rep, typename Period>
+    [[nodiscard]] bool waitForDiarizationIdleFor(
+        const std::chrono::duration<Rep, Period> &timeout)
+    {
+        std::unique_lock lock(stateMutex_);
+        return drainedCondition_.wait_for(lock, timeout, [this] {
+            return !processing_;
+        });
+    }
+
     [[nodiscard]] AsrFlushOutcome flushAsrBounded()
     {
         AsrFlushOutcome outcome;
@@ -1570,7 +2002,7 @@ private:
         auto state = std::make_shared<AsrFlushSharedState>();
         auto self = shared_from_this();
         std::thread([self = std::move(self), state] {
-            Expected<std::vector<AsrHypothesis>> result =
+            Expected<std::vector<AsrTimelineBatch>> result =
                 Error{LS_INTERNAL_ERROR, "ASR flush did not run"};
             try {
                 result = self->asr_->flush();
@@ -1615,7 +2047,7 @@ private:
         if (!result) {
             outcome.error = result.error();
         } else {
-            outcome.hypotheses = result.takeValue();
+            outcome.batches = result.takeValue();
         }
         return outcome;
     }
@@ -1668,9 +2100,7 @@ private:
         if (!checkpoint) {
             return checkpoint.error();
         }
-        journalCheckpoint_.store(
-            checkpoint.value(),
-            std::memory_order_relaxed);
+        advanceJournalCheckpoint(checkpoint.value());
         enqueueSourceEvent(std::move(gap));
         return success();
     }
@@ -1913,9 +2343,7 @@ private:
             auto checkpoint =
                 journal_->recordSourceEvent(record_.sessionId, gap);
             if (checkpoint) {
-                journalCheckpoint_.store(
-                    checkpoint.value(),
-                    std::memory_order_relaxed);
+                advanceJournalCheckpoint(checkpoint.value());
                 enqueueSourceEvent(std::move(gap));
             } else {
                 latchFatal(checkpoint.error(), sourceId);
@@ -1992,6 +2420,7 @@ private:
 
     mutable std::mutex stateMutex_;
     std::mutex lifecycleMutex_;
+    std::mutex resultCommitMutex_;
     std::condition_variable workCondition_;
     std::condition_variable drainedCondition_;
     std::deque<AudioWindow> audioQueue_;
@@ -2244,7 +2673,9 @@ ls_status_code_t ls_session_create_after_consent_v1(
         }
 
         auto diarization =
-            createDiarizationBackend(diarizationId.value());
+            createDiarizationBackend(
+                diarizationId.value(),
+                core->runtime->allowTestBackends());
         if (!diarization) {
             return report(diarization.error(), out_error);
         }

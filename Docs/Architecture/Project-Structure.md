@@ -32,11 +32,16 @@ LocalScribe/
 │   │       ├── Migrations.cpp
 │   │       └── RecoveryJournal.cpp
 │   └── tests/
+│       ├── AsrTimelineBatchTests.cpp
 │       ├── BackendTests.cpp
 │       ├── ContractTests.cpp
+│       ├── DiarizationInertiaTests.cpp
 │       ├── JournalRecoveryTests.cpp
 │       ├── MarkdownGoldenTests.cpp
+│       ├── PendingJournalTests.cpp
+│       ├── SpeakerSwitchContractTests.cpp
 │       ├── StateMachineTests.cpp
+│       ├── VoiceProfileTests.cpp
 │       └── fixtures/
 ├── macOS/
 │   ├── App/
@@ -136,32 +141,54 @@ backend-neutral and has no Apple dependency.
 - defines LocalScribe-owned ASR/diarization value types and interfaces;
 - contains backend factories;
 - keeps third-party headers out of public include directories;
+- emits ordered `AsrTimelineBatch` values only for fully decoded per-source
+  intervals, including empty decoded-silence batches and discontinuity markers;
+- expresses diarization output as atomic `DiarizationUpdate` operations:
+  per-hypothesis `commit`/`hold` decisions and whole-group `resolve` results;
+- owns the in-memory acoustic evidence and five-second decoded System Audio
+  deadline, but does not own persistence or publication;
 - seeds each diarization session with compatible saved voice profiles and keeps
-  incompatible or low-confidence observations anonymous;
-- produces partial hypotheses for UI and stable final revisions for the session.
+  incompatible or low-confidence observations anonymous.
 
 ### `Core/session`
 
 - owns the canonical transition table;
-- orders source events and transcript revisions;
+- consumes each returned ASR batch sequence in order and passes its per-source
+  decoded watermark to diarization after the batch's hypotheses;
+- orders source events, transcript revisions, and diarization group operations;
 - decides the terminal completeness result;
-- makes a final segment durable before publishing its event.
+- routes `commit` directly to visible persistence and `hold` to hidden durable
+  staging, then atomically promotes every revision named by `resolve`;
+- flushes pending diarization with an explicit pause or end-of-stream reason and
+  forbids paused/terminal boundaries while a group remains unresolved;
+- makes every visible Final Segment durable before publishing its event.
 
 ### `Core/storage`
 
 - owns SQLite migrations and transactions;
-- persists session phase, sources, discontinuities, final segment revisions,
-  render checkpoint, publication receipts, and bounded versioned voice-profile
-  descriptors;
+- persists session phase, sources, discontinuities, visible Final Segment
+  revisions, render checkpoint, publication receipts, and bounded versioned
+  voice-profile descriptors;
+- owns SQLite schema version 3 hidden pending groups with complete Final Segment
+  payloads, descriptors, fallback attribution, confidence, and deadline, but
+  never persists the speculative target identity;
+- advances the journal checkpoint when a group is staged without advancing the
+  highest visible revision or timeline origin, and atomically promotes a whole
+  group under one later checkpoint;
+- fallback-promotes every unresolved durable group before marking a crashed
+  session `recovery_required`, so final text survives without reconstructing
+  speculative acoustic state;
 - atomically enrolls a named profile and relabels the selected session without
-  retaining raw audio;
+  retaining raw audio or reading hidden pending descriptors;
 - discovers nonterminal sessions after a crash;
 - contains no vault or security-scoped URL logic.
 
 ### `Core/output`
 
-- renders deterministic UTF-8 Markdown/JSON values from immutable journal
-  snapshots;
+- renders deterministic UTF-8 Markdown/JSON values from the visible rows of
+  immutable journal snapshots;
+- excludes hidden pending text, descriptors, and fallback labels until atomic
+  promotion;
 - owns schema versions, YAML escaping, marker neutralization, and golden files;
 - does not write to a filesystem.
 
@@ -251,7 +278,9 @@ The repository checks:
 - no `Core/` source imports an Apple framework;
 - no public core header exposes C++ or inference types;
 - no mobile platform appears in manifest/project product declarations;
-- only final segments reach renderer golden files;
+- only visible, promoted Final Segments reach renderer golden files;
+- hidden pending groups cannot affect public events, committed-segment metrics,
+  participants, Voice Profile enrollment, or Markdown;
 - app network APIs are absent from the main product target;
 - content-like fields are absent from diagnostics.
 
@@ -264,6 +293,9 @@ test executable must compile, link, and pass without any macOS framework.
 |---|---|
 | State transitions/invariants | portable C++ unit tests |
 | SQLite migrations/recovery | portable C++ tests with temporary DB |
+| ASR decoded watermarks, empty batches, and discontinuity ordering | portable C++ backend/session tests |
+| Diarization inertia and `commit`/`hold`/`resolve` semantics | portable C++ backend tests |
+| Hidden staging, atomic promotion, flush boundaries, and recovery fallback | portable C++ storage/session/ABI tests |
 | Voice-profile CRUD, format compatibility, and cross-session matching | portable C++ storage/backend/ABI tests |
 | Markdown escaping/determinism | portable golden tests |
 | ABI sizes/ownership/errors | C contract tests + Swift bridge tests |

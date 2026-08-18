@@ -247,6 +247,64 @@ PRAGMA user_version = 2;
 COMMIT;
 )SQL";
 
+    static constexpr const char *kMigrationV3 = R"SQL(
+BEGIN IMMEDIATE;
+
+CREATE TABLE pending_speaker_groups (
+    session_id TEXT NOT NULL
+        REFERENCES sessions(session_id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL CHECK (group_id > 0),
+    deadline_monotonic_ns INTEGER NOT NULL CHECK (deadline_monotonic_ns >= 0),
+    created_checkpoint INTEGER NOT NULL CHECK (created_checkpoint > 0),
+    resolved_checkpoint INTEGER DEFAULT NULL CHECK (
+        resolved_checkpoint IS NULL
+        OR resolved_checkpoint >= created_checkpoint
+    ),
+    PRIMARY KEY (session_id, group_id)
+);
+
+CREATE INDEX pending_speaker_groups_unresolved_deadline
+    ON pending_speaker_groups(
+        session_id, resolved_checkpoint, deadline_monotonic_ns, group_id
+    );
+
+CREATE TABLE pending_speaker_segments (
+    session_id TEXT NOT NULL,
+    group_id INTEGER NOT NULL,
+    stable_id BLOB NOT NULL CHECK (length(stable_id) = 16),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    source_id INTEGER NOT NULL,
+    start_time_ns INTEGER NOT NULL,
+    end_time_ns INTEGER NOT NULL,
+    speaker_id INTEGER NOT NULL,
+    speaker_label TEXT NOT NULL,
+    text TEXT NOT NULL,
+    language TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    flags INTEGER NOT NULL,
+    staged_checkpoint INTEGER NOT NULL CHECK (staged_checkpoint > 0),
+    speaker_embedding_model TEXT NOT NULL DEFAULT '',
+    speaker_embedding_dimension INTEGER NOT NULL DEFAULT 0
+        CHECK (speaker_embedding_dimension >= 0),
+    speaker_embedding BLOB NOT NULL DEFAULT X'' CHECK (
+        length(speaker_embedding) = speaker_embedding_dimension * 4
+    ),
+    PRIMARY KEY (session_id, group_id, stable_id, revision),
+    FOREIGN KEY (session_id, group_id)
+        REFERENCES pending_speaker_groups(session_id, group_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX pending_speaker_segments_group_order
+    ON pending_speaker_segments(
+        session_id, group_id, start_time_ns, end_time_ns, source_id,
+        stable_id, revision
+    );
+
+PRAGMA user_version = 3;
+COMMIT;
+)SQL";
+
     int currentVersion = version.value();
     if (currentVersion < 1) {
         auto migration = execute(database, kMigrationV1);
@@ -258,6 +316,14 @@ COMMIT;
     }
     if (currentVersion < 2) {
         auto migration = execute(database, kMigrationV2);
+        if (!migration) {
+            (void)execute(database, "ROLLBACK");
+            return migration;
+        }
+        currentVersion = 2;
+    }
+    if (currentVersion < 3) {
+        auto migration = execute(database, kMigrationV3);
         if (!migration) {
             (void)execute(database, "ROLLBACK");
             return migration;

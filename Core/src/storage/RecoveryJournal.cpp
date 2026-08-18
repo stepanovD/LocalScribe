@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -394,6 +395,420 @@ bool sameSegment(sqlite3_stmt *row, const TranscriptSegment &segment)
         && sameEmbedding;
 }
 
+bool validFinalSegment(const TranscriptSegment &segment)
+{
+    return (segment.flags & LS_SEGMENT_FLAG_FINAL) != 0
+        && segment.revision != 0
+        && segment.endTimeNs >= segment.startTimeNs
+        && std::isfinite(segment.confidence)
+        && segment.confidence >= 0.0F && segment.confidence <= 1.0F
+        && validEmbedding(
+            segment.speakerEmbeddingModel,
+            segment.speakerEmbedding,
+            true);
+}
+
+bool sameSegmentPayload(
+    const TranscriptSegment &left,
+    const TranscriptSegment &right)
+{
+    return left.stableId == right.stableId
+        && left.revision == right.revision
+        && left.sourceId == right.sourceId
+        && left.startTimeNs == right.startTimeNs
+        && left.endTimeNs == right.endTimeNs
+        && left.speakerId == right.speakerId
+        && left.speakerLabel == right.speakerLabel
+        && left.text == right.text
+        && left.language == right.language
+        && left.confidence == right.confidence
+        && left.flags == right.flags
+        && left.speakerEmbeddingModel == right.speakerEmbeddingModel
+        && left.speakerEmbedding == right.speakerEmbedding;
+}
+
+Expected<TranscriptSegment> decodeStoredSegment(sqlite3_stmt *row)
+{
+    TranscriptSegment segment;
+    const auto *stable = static_cast<const std::uint8_t *>(
+        sqlite3_column_blob(row, 0));
+    if (stable == nullptr || sqlite3_column_bytes(row, 0) != 16) {
+        return Error{LS_RECOVERY_ERROR, "journal has invalid stable ID"};
+    }
+    std::copy_n(stable, 16, segment.stableId.begin());
+    segment.sourceId = static_cast<std::uint64_t>(
+        sqlite3_column_int64(row, 1));
+    segment.startTimeNs = sqlite3_column_int64(row, 2);
+    segment.endTimeNs = sqlite3_column_int64(row, 3);
+    segment.speakerId = static_cast<std::uint64_t>(
+        sqlite3_column_int64(row, 4));
+    segment.speakerLabel = columnText(row, 5);
+    segment.text = columnText(row, 6);
+    segment.language = columnText(row, 7);
+    segment.confidence = static_cast<float>(sqlite3_column_double(row, 8));
+    segment.flags = static_cast<std::uint32_t>(
+        sqlite3_column_int64(row, 9));
+    segment.speakerEmbeddingModel = columnText(row, 10);
+    const auto embedding = decodeEmbedding(row, 12, true);
+    segment.revision = static_cast<std::uint32_t>(
+        sqlite3_column_int64(row, 13));
+    segment.journalCheckpoint = static_cast<std::uint64_t>(
+        sqlite3_column_int64(row, 14));
+    if (!embedding
+        || static_cast<std::size_t>(sqlite3_column_int64(row, 11))
+            != embedding.value().size()) {
+        return Error{
+            LS_RECOVERY_ERROR,
+            "journal has an invalid pending or visible segment"};
+    }
+    segment.speakerEmbedding = embedding.value();
+    if (!validFinalSegment(segment)) {
+        return Error{
+            LS_RECOVERY_ERROR,
+            "journal has an invalid pending or visible segment"};
+    }
+    return segment;
+}
+
+Expected<std::vector<TranscriptSegment>> loadPendingSegments(
+    sqlite3 *database,
+    const std::string &sessionId,
+    std::uint64_t groupId)
+{
+    Statement statement;
+    auto prepared = prepare(
+        database,
+        R"SQL(
+SELECT stable_id, source_id, start_time_ns, end_time_ns, speaker_id,
+       speaker_label, text, language, confidence, flags,
+       speaker_embedding_model, speaker_embedding_dimension,
+       speaker_embedding, revision, staged_checkpoint
+FROM pending_speaker_segments
+WHERE session_id = ? AND group_id = ?
+ORDER BY start_time_ns, end_time_ns, source_id, hex(stable_id), revision
+)SQL",
+        statement);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(statement.get(), 1, sessionId);
+    sqlite3_bind_int64(
+        statement.get(),
+        2,
+        static_cast<sqlite3_int64>(groupId));
+    std::vector<TranscriptSegment> result;
+    int step = SQLITE_ROW;
+    while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+        auto segment = decodeStoredSegment(statement.get());
+        if (!segment) {
+            return segment.error();
+        }
+        result.push_back(segment.takeValue());
+    }
+    if (step != SQLITE_DONE) {
+        return sqliteError(database, "cannot load pending speaker group");
+    }
+    return result;
+}
+
+Expected<TranscriptSegment> applySpeakerEnrollment(
+    sqlite3 *database,
+    const std::string &sessionId,
+    const TranscriptSegment &segment)
+{
+    TranscriptSegment effective = segment;
+    Statement enrollment;
+    auto prepared = prepare(
+        database,
+        R"SQL(
+SELECT profile_id, display_name
+FROM session_voice_profile_enrollments
+WHERE session_id = ? AND original_speaker_id = ?
+)SQL",
+        enrollment);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(enrollment.get(), 1, sessionId);
+    sqlite3_bind_int64(
+        enrollment.get(),
+        2,
+        static_cast<sqlite3_int64>(segment.speakerId));
+    const int step = sqlite3_step(enrollment.get());
+    if (step == SQLITE_DONE) {
+        return effective;
+    }
+    if (step != SQLITE_ROW) {
+        return sqliteError(database, "cannot inspect speaker enrollment");
+    }
+    const auto profileId = static_cast<std::uint64_t>(
+        sqlite3_column_int64(enrollment.get(), 0));
+    const auto displayName = columnText(enrollment.get(), 1);
+    if (profileId == 0 || profileId > kSpeakerIdPayloadMask
+        || !validProfileName(displayName)) {
+        return Error{
+            LS_RECOVERY_ERROR,
+            "journal has an invalid speaker enrollment"};
+    }
+    effective.speakerId = persistentSpeakerId(profileId);
+    effective.speakerLabel = displayName;
+    return effective;
+}
+
+Expected<std::optional<TranscriptSegment>> loadLatestVisibleSegment(
+    sqlite3 *database,
+    const std::string &sessionId,
+    const StableId &stableId)
+{
+    Statement statement;
+    auto prepared = prepare(
+        database,
+        R"SQL(
+SELECT stable_id, source_id, start_time_ns, end_time_ns, speaker_id,
+       speaker_label, text, language, confidence, flags,
+       speaker_embedding_model, speaker_embedding_dimension,
+       speaker_embedding, revision, journal_checkpoint
+FROM segments
+WHERE session_id = ? AND stable_id = ?
+ORDER BY revision DESC
+LIMIT 1
+)SQL",
+        statement);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(statement.get(), 1, sessionId);
+    sqlite3_bind_blob(
+        statement.get(),
+        2,
+        stableId.data(),
+        static_cast<int>(stableId.size()),
+        SQLITE_TRANSIENT);
+    const int step = sqlite3_step(statement.get());
+    if (step == SQLITE_DONE) {
+        return std::optional<TranscriptSegment>{};
+    }
+    if (step != SQLITE_ROW) {
+        return sqliteError(database, "cannot inspect visible segment");
+    }
+    auto segment = decodeStoredSegment(statement.get());
+    if (!segment) {
+        return segment.error();
+    }
+    return std::optional<TranscriptSegment>{segment.takeValue()};
+}
+
+Expected<std::optional<TranscriptSegment>> loadVisibleSegmentRevision(
+    sqlite3 *database,
+    const std::string &sessionId,
+    const StableId &stableId,
+    std::uint32_t revision)
+{
+    Statement statement;
+    auto prepared = prepare(
+        database,
+        R"SQL(
+SELECT stable_id, source_id, start_time_ns, end_time_ns, speaker_id,
+       speaker_label, text, language, confidence, flags,
+       speaker_embedding_model, speaker_embedding_dimension,
+       speaker_embedding, revision, journal_checkpoint
+FROM segments
+WHERE session_id = ? AND stable_id = ? AND revision = ?
+)SQL",
+        statement);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(statement.get(), 1, sessionId);
+    sqlite3_bind_blob(
+        statement.get(),
+        2,
+        stableId.data(),
+        static_cast<int>(stableId.size()),
+        SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement.get(), 3, revision);
+    const int step = sqlite3_step(statement.get());
+    if (step == SQLITE_DONE) {
+        return std::optional<TranscriptSegment>{};
+    }
+    if (step != SQLITE_ROW) {
+        return sqliteError(database, "cannot inspect visible segment revision");
+    }
+    auto segment = decodeStoredSegment(statement.get());
+    if (!segment) {
+        return segment.error();
+    }
+    return std::optional<TranscriptSegment>{segment.takeValue()};
+}
+
+bool validSpeakerTurn(const SpeakerTurn &turn)
+{
+    return turn.revision != 0 && turn.endTimeNs >= turn.startTimeNs
+        && turn.speakerId != 0 && !turn.speakerLabel.empty()
+        && std::isfinite(turn.confidence)
+        && turn.confidence >= 0.0F && turn.confidence <= 1.0F;
+}
+
+bool validRemoteSpeakerId(std::uint64_t speakerId)
+{
+    const auto namespaceBits =
+        speakerId & (kAnonymousSpeakerFlag | kPersistentSpeakerFlag);
+    const bool anonymous = namespaceBits == kAnonymousSpeakerFlag
+        && (speakerId & kSpeakerIdPayloadMask) != 0;
+    const bool persistent = isPersistentSpeakerId(speakerId)
+        && profileIdFromSpeakerId(speakerId) != 0;
+    return anonymous || persistent;
+}
+
+Expected<std::vector<TranscriptSegment>> resolvePendingPayload(
+    sqlite3 *database,
+    const std::string &sessionId,
+    std::uint64_t groupId,
+    std::span<const SpeakerTurn> attributions)
+{
+    auto pending = loadPendingSegments(database, sessionId, groupId);
+    if (!pending) {
+        return pending.error();
+    }
+    if (pending.value().empty()) {
+        return Error{
+            LS_RECOVERY_ERROR,
+            "pending speaker group has no segments"};
+    }
+    if (!attributions.empty()
+        && attributions.size() != pending.value().size()) {
+        return Error{
+            LS_CONFLICT,
+            "speaker resolution does not cover the entire pending group"};
+    }
+    if (!attributions.empty()) {
+        const auto targetSpeakerId = attributions.front().speakerId;
+        const auto &targetSpeakerLabel =
+            attributions.front().speakerLabel;
+        if (!validRemoteSpeakerId(targetSpeakerId)
+            || std::any_of(
+                attributions.begin() + 1,
+                attributions.end(),
+                [&](const SpeakerTurn &turn) {
+                    return turn.speakerId != targetSpeakerId
+                        || turn.speakerLabel != targetSpeakerLabel;
+                })) {
+            return Error{
+                LS_CONFLICT,
+                "speaker resolution must name one remote speaker"};
+        }
+    }
+
+    std::vector<TranscriptSegment> result;
+    result.reserve(pending.value().size());
+    for (const auto &fallback : pending.value()) {
+        TranscriptSegment resolved = fallback;
+        if (!attributions.empty()) {
+            const auto match = std::find_if(
+                attributions.begin(),
+                attributions.end(),
+                [&](const SpeakerTurn &turn) {
+                    return turn.stableId == fallback.stableId
+                        && turn.revision == fallback.revision;
+                });
+            if (match == attributions.end()
+                || !validSpeakerTurn(*match)
+                || match->sourceId != fallback.sourceId
+                || match->startTimeNs != fallback.startTimeNs
+                || match->endTimeNs != fallback.endTimeNs) {
+                return Error{
+                    LS_CONFLICT,
+                    "speaker resolution does not match held payload"};
+            }
+            resolved.speakerId = match->speakerId;
+            resolved.speakerLabel = match->speakerLabel;
+        }
+        auto effective = applySpeakerEnrollment(
+            database,
+            sessionId,
+            resolved);
+        if (!effective) {
+            return effective.error();
+        }
+        result.push_back(effective.takeValue());
+    }
+
+    if (!attributions.empty()) {
+        for (std::size_t index = 0; index < attributions.size(); ++index) {
+            const auto duplicate = std::find_if(
+                attributions.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                attributions.end(),
+                [&](const SpeakerTurn &candidate) {
+                    return candidate.stableId == attributions[index].stableId
+                        && candidate.revision == attributions[index].revision;
+                });
+            if (duplicate != attributions.end()) {
+                return Error{
+                    LS_CONFLICT,
+                    "speaker resolution repeats a held segment"};
+            }
+        }
+    }
+    return result;
+}
+
+Expected<void> insertVisibleSegment(
+    sqlite3 *database,
+    const std::string &sessionId,
+    const TranscriptSegment &segment,
+    std::uint64_t checkpoint)
+{
+    Statement insert;
+    auto prepared = prepare(
+        database,
+        R"SQL(
+INSERT INTO segments(
+    session_id, stable_id, revision, source_id, start_time_ns, end_time_ns,
+    speaker_id, speaker_label, text, language, confidence, flags,
+    journal_checkpoint, speaker_embedding_model, speaker_embedding_dimension,
+    speaker_embedding
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+)SQL",
+        insert);
+    if (!prepared) {
+        return prepared.error();
+    }
+    bindText(insert.get(), 1, sessionId);
+    sqlite3_bind_blob(
+        insert.get(),
+        2,
+        segment.stableId.data(),
+        static_cast<int>(segment.stableId.size()),
+        SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert.get(), 3, segment.revision);
+    sqlite3_bind_int64(
+        insert.get(),
+        4,
+        static_cast<sqlite3_int64>(segment.sourceId));
+    sqlite3_bind_int64(insert.get(), 5, segment.startTimeNs);
+    sqlite3_bind_int64(insert.get(), 6, segment.endTimeNs);
+    sqlite3_bind_int64(
+        insert.get(),
+        7,
+        static_cast<sqlite3_int64>(segment.speakerId));
+    bindText(insert.get(), 8, segment.speakerLabel);
+    bindText(insert.get(), 9, segment.text);
+    bindText(insert.get(), 10, segment.language);
+    sqlite3_bind_double(insert.get(), 11, segment.confidence);
+    sqlite3_bind_int64(insert.get(), 12, segment.flags);
+    sqlite3_bind_int64(
+        insert.get(),
+        13,
+        static_cast<sqlite3_int64>(checkpoint));
+    bindText(insert.get(), 14, segment.speakerEmbeddingModel);
+    sqlite3_bind_int64(
+        insert.get(),
+        15,
+        static_cast<sqlite3_int64>(segment.speakerEmbedding.size()));
+    bindEmbedding(insert.get(), 16, segment.speakerEmbedding);
+    return stepDone(database, insert.get());
+}
+
 bool validDigest(const std::string &digest)
 {
     return digest.size() == 64
@@ -407,6 +822,14 @@ bool publicationMustMatchCurrentCheckpoint(ls_phase_t phase)
 {
     return phase == LS_PHASE_RECOVERY_REQUIRED
         || phase == LS_PHASE_COMPLETE
+        || phase == LS_PHASE_INCOMPLETE_SOURCES
+        || phase == LS_PHASE_INTERRUPTED
+        || phase == LS_PHASE_FAILED_TO_START;
+}
+
+bool isTerminalPhase(ls_phase_t phase)
+{
+    return phase == LS_PHASE_COMPLETE
         || phase == LS_PHASE_INCOMPLETE_SOURCES
         || phase == LS_PHASE_INTERRUPTED
         || phase == LS_PHASE_FAILED_TO_START;
@@ -650,6 +1073,29 @@ Expected<std::uint64_t> RecoveryJournal::transition(
             LS_INVALID_STATE,
             "journal phase changed before transition"};
     }
+    if (isTerminalPhase(next)) {
+        Statement pending;
+        auto prepared = prepare(
+            database_,
+            "SELECT 1 FROM pending_speaker_groups "
+            "WHERE session_id = ? AND resolved_checkpoint IS NULL LIMIT 1",
+            pending);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(pending.get(), 1, sessionId);
+        const int pendingStep = sqlite3_step(pending.get());
+        if (pendingStep == SQLITE_ROW) {
+            return Error{
+                LS_INVALID_STATE,
+                "pending speaker groups must resolve before terminal phase"};
+        }
+        if (pendingStep != SQLITE_DONE) {
+            return sqliteError(
+                database_,
+                "cannot inspect pending speaker groups before transition");
+        }
+    }
 
     Statement sequence;
     auto prepared = prepare(
@@ -726,14 +1172,7 @@ Expected<std::uint64_t> RecoveryJournal::appendFinalSegment(
     const std::string &sessionId,
     TranscriptSegment &segment)
 {
-    if ((segment.flags & LS_SEGMENT_FLAG_FINAL) == 0
-        || segment.revision == 0 || segment.endTimeNs < segment.startTimeNs
-        || !std::isfinite(segment.confidence)
-        || segment.confidence < 0.0F || segment.confidence > 1.0F
-        || !validEmbedding(
-            segment.speakerEmbeddingModel,
-            segment.speakerEmbedding,
-            true)) {
+    if (!validFinalSegment(segment)) {
         return Error{LS_INVALID_ARGUMENT, "final segment is invalid"};
     }
 
@@ -918,6 +1357,751 @@ INSERT INTO segments(
     effectiveSegment.journalCheckpoint = checkpoint;
     segment = std::move(effectiveSegment);
     return checkpoint;
+}
+
+Expected<DiarizationJournalBatchResult>
+RecoveryJournal::applyDiarizationBatch(
+    const std::string &sessionId,
+    const DiarizationJournalBatch &batch)
+{
+    return applyDiarizationBatchImpl(sessionId, batch, false);
+}
+
+Expected<DiarizationJournalBatchResult>
+RecoveryJournal::applyDiarizationBatchImpl(
+    const std::string &sessionId,
+    const DiarizationJournalBatch &batch,
+    bool resolveAllPendingToFallback)
+{
+    std::vector<PendingSpeakerGroupStage> holds;
+    for (const auto &hold : batch.holds) {
+        if (hold.groupId == 0
+            || hold.groupId
+                > static_cast<std::uint64_t>(
+                    std::numeric_limits<sqlite3_int64>::max())
+            || hold.deadlineMonotonicNs < 0
+            || hold.fallbackSegments.empty()
+            || std::any_of(
+                hold.fallbackSegments.begin(),
+                hold.fallbackSegments.end(),
+                [](const TranscriptSegment &segment) {
+                    return !validFinalSegment(segment);
+                })) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "pending speaker group is invalid"};
+        }
+        auto existingGroup = std::find_if(
+            holds.begin(),
+            holds.end(),
+            [&](const PendingSpeakerGroupStage &candidate) {
+                return candidate.groupId == hold.groupId;
+            });
+        if (existingGroup == holds.end()) {
+            holds.push_back(hold);
+            continue;
+        }
+        if (existingGroup->deadlineMonotonicNs
+            != hold.deadlineMonotonicNs) {
+            return Error{
+                LS_CONFLICT,
+                "pending speaker group deadline changed"};
+        }
+        for (const auto &segment : hold.fallbackSegments) {
+            const auto duplicate = std::find_if(
+                existingGroup->fallbackSegments.begin(),
+                existingGroup->fallbackSegments.end(),
+                [&](const TranscriptSegment &candidate) {
+                    return candidate.stableId == segment.stableId
+                        && candidate.revision == segment.revision;
+                });
+            if (duplicate == existingGroup->fallbackSegments.end()) {
+                existingGroup->fallbackSegments.push_back(segment);
+            } else if (!sameSegmentPayload(*duplicate, segment)) {
+                return Error{
+                    LS_CONFLICT,
+                    "same pending segment revision has different content"};
+            }
+        }
+    }
+    std::vector<PendingSpeakerGroupResolution> resolutions;
+    for (const auto &resolution : batch.resolutions) {
+        if (resolution.groupId == 0
+            || resolution.groupId
+                > static_cast<std::uint64_t>(
+                    std::numeric_limits<sqlite3_int64>::max())) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "pending speaker resolution is invalid"};
+        }
+        if (std::any_of(
+                resolution.attributions.begin(),
+                resolution.attributions.end(),
+                [](const SpeakerTurn &turn) {
+                    return !validSpeakerTurn(turn);
+                })) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "pending speaker attribution is invalid"};
+        }
+        if (std::any_of(
+                resolutions.begin(),
+                resolutions.end(),
+                [&](const PendingSpeakerGroupResolution &candidate) {
+                    return candidate.groupId == resolution.groupId;
+                })) {
+            return Error{
+                LS_CONFLICT,
+                "pending speaker group is resolved twice in one batch"};
+        }
+        resolutions.push_back(resolution);
+    }
+    std::vector<TranscriptSegment> commits;
+    for (const auto &commit : batch.commits) {
+        if (!validFinalSegment(commit)) {
+            return Error{
+                LS_INVALID_ARGUMENT,
+                "committed diarization segment is invalid"};
+        }
+        const auto duplicate = std::find_if(
+            commits.begin(),
+            commits.end(),
+            [&](const TranscriptSegment &candidate) {
+                return candidate.stableId == commit.stableId
+                    && candidate.revision == commit.revision;
+            });
+        if (duplicate == commits.end()) {
+            commits.push_back(commit);
+        } else if (!sameSegmentPayload(*duplicate, commit)) {
+            return Error{
+                LS_CONFLICT,
+                "same committed segment revision has different content"};
+        }
+    }
+
+    std::lock_guard lock(mutex_);
+    Transaction transaction(database_);
+    if (!transaction.active()) {
+        return sqliteError(database_, "cannot begin diarization transaction");
+    }
+    auto session = loadSessionLocked(sessionId);
+    if (!session) {
+        return session.error();
+    }
+
+    DiarizationJournalBatchResult result;
+    result.journalCheckpoint = session.value().journalCheckpoint;
+    result.highestSegmentRevision =
+        session.value().highestSegmentRevision;
+
+    if (resolveAllPendingToFallback) {
+        Statement unresolved;
+        auto prepared = prepare(
+            database_,
+            "SELECT group_id FROM pending_speaker_groups "
+            "WHERE session_id = ? AND resolved_checkpoint IS NULL "
+            "ORDER BY deadline_monotonic_ns, group_id",
+            unresolved);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(unresolved.get(), 1, sessionId);
+        int step = SQLITE_ROW;
+        while ((step = sqlite3_step(unresolved.get())) == SQLITE_ROW) {
+            const auto groupId = static_cast<std::uint64_t>(
+                sqlite3_column_int64(unresolved.get(), 0));
+            if (groupId == 0
+                || groupId
+                    > static_cast<std::uint64_t>(
+                        std::numeric_limits<sqlite3_int64>::max())) {
+                return Error{
+                    LS_RECOVERY_ERROR,
+                    "journal has an invalid pending speaker group"};
+            }
+            const auto duplicate = std::find_if(
+                resolutions.begin(),
+                resolutions.end(),
+                [&](const PendingSpeakerGroupResolution &resolution) {
+                    return resolution.groupId == groupId;
+                });
+            if (duplicate == resolutions.end()) {
+                resolutions.push_back(PendingSpeakerGroupResolution{
+                    groupId,
+                    {}});
+            }
+        }
+        if (step != SQLITE_DONE) {
+            return sqliteError(
+                database_,
+                "cannot discover pending speaker groups");
+        }
+    }
+
+    struct HoldWork {
+        const PendingSpeakerGroupStage *hold{};
+        bool insertGroup{};
+        std::vector<const TranscriptSegment *> insertSegments;
+    };
+    std::vector<HoldWork> work;
+    bool changed = false;
+    for (const auto &hold : holds) {
+        HoldWork item;
+        item.hold = &hold;
+        Statement group;
+        auto prepared = prepare(
+            database_,
+            R"SQL(
+SELECT deadline_monotonic_ns, resolved_checkpoint
+FROM pending_speaker_groups
+WHERE session_id = ? AND group_id = ?
+)SQL",
+            group);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(group.get(), 1, sessionId);
+        sqlite3_bind_int64(
+            group.get(),
+            2,
+            static_cast<sqlite3_int64>(hold.groupId));
+        const int groupStep = sqlite3_step(group.get());
+        if (groupStep != SQLITE_ROW && groupStep != SQLITE_DONE) {
+            return sqliteError(database_, "cannot inspect pending group");
+        }
+        const bool groupExists = groupStep == SQLITE_ROW;
+        const bool groupResolved = groupExists
+            && sqlite3_column_type(group.get(), 1) != SQLITE_NULL;
+        if (groupExists
+            && sqlite3_column_int64(group.get(), 0)
+                != hold.deadlineMonotonicNs) {
+            return Error{
+                LS_CONFLICT,
+                "pending speaker group deadline changed"};
+        }
+        item.insertGroup = !groupExists;
+        changed = changed || item.insertGroup;
+
+        for (const auto &segment : hold.fallbackSegments) {
+            Statement existing;
+            prepared = prepare(
+                database_,
+                R"SQL(
+SELECT stable_id, source_id, start_time_ns, end_time_ns, speaker_id,
+       speaker_label, text, language, confidence, flags,
+       speaker_embedding_model, speaker_embedding_dimension,
+       speaker_embedding
+FROM pending_speaker_segments
+WHERE session_id = ? AND group_id = ? AND stable_id = ? AND revision = ?
+)SQL",
+                existing);
+            if (!prepared) {
+                return prepared.error();
+            }
+            bindText(existing.get(), 1, sessionId);
+            sqlite3_bind_int64(
+                existing.get(),
+                2,
+                static_cast<sqlite3_int64>(hold.groupId));
+            sqlite3_bind_blob(
+                existing.get(),
+                3,
+                segment.stableId.data(),
+                static_cast<int>(segment.stableId.size()),
+                SQLITE_TRANSIENT);
+            sqlite3_bind_int64(existing.get(), 4, segment.revision);
+            const int existingStep = sqlite3_step(existing.get());
+            if (existingStep != SQLITE_ROW && existingStep != SQLITE_DONE) {
+                return sqliteError(
+                    database_,
+                    "cannot inspect pending segment");
+            }
+            if (existingStep == SQLITE_ROW) {
+                if (!sameSegment(existing.get(), segment)) {
+                    return Error{
+                        LS_CONFLICT,
+                        "same pending segment revision has different content"};
+                }
+                continue;
+            }
+            if (groupResolved) {
+                return Error{
+                    LS_CONFLICT,
+                    "resolved pending speaker group cannot be extended"};
+            }
+            item.insertSegments.push_back(&segment);
+            changed = true;
+        }
+        work.push_back(std::move(item));
+    }
+
+    struct ResolutionWork {
+        const PendingSpeakerGroupResolution *resolution{};
+        bool unresolved{};
+    };
+    std::vector<ResolutionWork> resolutionWork;
+    for (const auto &resolution : resolutions) {
+        Statement group;
+        auto prepared = prepare(
+            database_,
+            "SELECT resolved_checkpoint FROM pending_speaker_groups "
+            "WHERE session_id = ? AND group_id = ?",
+            group);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(group.get(), 1, sessionId);
+        sqlite3_bind_int64(
+            group.get(),
+            2,
+            static_cast<sqlite3_int64>(resolution.groupId));
+        const int groupStep = sqlite3_step(group.get());
+        if (groupStep != SQLITE_ROW && groupStep != SQLITE_DONE) {
+            return sqliteError(
+                database_,
+                "cannot inspect pending group resolution");
+        }
+        const bool exists = groupStep == SQLITE_ROW;
+        const bool anticipated = std::any_of(
+            holds.begin(),
+            holds.end(),
+            [&](const PendingSpeakerGroupStage &hold) {
+                return hold.groupId == resolution.groupId;
+            });
+        if (!exists && !anticipated) {
+            return Error{
+                LS_NOT_FOUND,
+                "pending speaker group was not found"};
+        }
+        const bool unresolved = !exists
+            || sqlite3_column_type(group.get(), 0) == SQLITE_NULL;
+        if (!unresolved) {
+            auto expected = resolvePendingPayload(
+                database_,
+                sessionId,
+                resolution.groupId,
+                resolution.attributions);
+            if (!expected) {
+                return expected.error();
+            }
+            for (const auto &segment : expected.value()) {
+                auto visible = loadVisibleSegmentRevision(
+                    database_,
+                    sessionId,
+                    segment.stableId,
+                    segment.revision);
+                if (!visible) {
+                    return visible.error();
+                }
+                if (!visible.value().has_value()) {
+                    return Error{
+                        LS_RECOVERY_ERROR,
+                        "resolved pending group is not fully visible"};
+                }
+                auto effectiveVisible = applySpeakerEnrollment(
+                    database_,
+                    sessionId,
+                    *visible.value());
+                if (!effectiveVisible) {
+                    return effectiveVisible.error();
+                }
+                if (!sameSegmentPayload(
+                        effectiveVisible.value(),
+                        segment)) {
+                    return Error{
+                        LS_CONFLICT,
+                        "speaker group resolution differs from prior result"};
+                }
+            }
+        } else {
+            changed = true;
+        }
+        resolutionWork.push_back(ResolutionWork{&resolution, unresolved});
+    }
+
+    std::vector<TranscriptSegment> commitWork;
+    for (const auto &commit : commits) {
+        auto effective = applySpeakerEnrollment(database_, sessionId, commit);
+        if (!effective) {
+            return effective.error();
+        }
+        auto latest = loadLatestVisibleSegment(
+            database_,
+            sessionId,
+            effective.value().stableId);
+        if (!latest) {
+            return latest.error();
+        }
+        if (latest.value().has_value()) {
+            if (latest.value()->revision > effective.value().revision) {
+                return Error{
+                    LS_CONFLICT,
+                    "segment revision would move backwards"};
+            }
+            if (latest.value()->revision == effective.value().revision) {
+                auto effectiveLatest = applySpeakerEnrollment(
+                    database_,
+                    sessionId,
+                    *latest.value());
+                if (!effectiveLatest) {
+                    return effectiveLatest.error();
+                }
+                if (!sameSegmentPayload(commit, *latest.value())
+                    && !sameSegmentPayload(
+                        effective.value(),
+                        effectiveLatest.value())) {
+                    return Error{
+                        LS_CONFLICT,
+                        "same segment revision has different content"};
+                }
+                continue;
+            }
+        }
+        commitWork.push_back(effective.takeValue());
+        changed = true;
+    }
+
+    if (!changed) {
+        if (auto committed = transaction.commit(); !committed) {
+            return committed.error();
+        }
+        return result;
+    }
+    if (session.value().journalCheckpoint
+        == std::numeric_limits<std::uint64_t>::max()) {
+        return Error{LS_CONFLICT, "journal checkpoint space is exhausted"};
+    }
+    const std::uint64_t checkpoint =
+        session.value().journalCheckpoint + 1u;
+
+    for (const auto &item : work) {
+        const auto &hold = *item.hold;
+        if (item.insertGroup) {
+            Statement group;
+            auto prepared = prepare(
+                database_,
+                R"SQL(
+INSERT INTO pending_speaker_groups(
+    session_id, group_id, deadline_monotonic_ns, created_checkpoint
+) VALUES (?, ?, ?, ?)
+)SQL",
+                group);
+            if (!prepared) {
+                return prepared.error();
+            }
+            bindText(group.get(), 1, sessionId);
+            sqlite3_bind_int64(
+                group.get(),
+                2,
+                static_cast<sqlite3_int64>(hold.groupId));
+            sqlite3_bind_int64(group.get(), 3, hold.deadlineMonotonicNs);
+            sqlite3_bind_int64(
+                group.get(),
+                4,
+                static_cast<sqlite3_int64>(checkpoint));
+            if (auto inserted = stepDone(database_, group.get()); !inserted) {
+                return inserted.error();
+            }
+        }
+
+        for (const auto *segment : item.insertSegments) {
+            Statement insert;
+            auto prepared = prepare(
+                database_,
+                R"SQL(
+INSERT INTO pending_speaker_segments(
+    session_id, group_id, stable_id, revision, source_id, start_time_ns,
+    end_time_ns, speaker_id, speaker_label, text, language, confidence,
+    flags, staged_checkpoint, speaker_embedding_model,
+    speaker_embedding_dimension, speaker_embedding
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+)SQL",
+                insert);
+            if (!prepared) {
+                return prepared.error();
+            }
+            bindText(insert.get(), 1, sessionId);
+            sqlite3_bind_int64(
+                insert.get(),
+                2,
+                static_cast<sqlite3_int64>(hold.groupId));
+            sqlite3_bind_blob(
+                insert.get(),
+                3,
+                segment->stableId.data(),
+                static_cast<int>(segment->stableId.size()),
+                SQLITE_TRANSIENT);
+            sqlite3_bind_int64(insert.get(), 4, segment->revision);
+            sqlite3_bind_int64(
+                insert.get(),
+                5,
+                static_cast<sqlite3_int64>(segment->sourceId));
+            sqlite3_bind_int64(insert.get(), 6, segment->startTimeNs);
+            sqlite3_bind_int64(insert.get(), 7, segment->endTimeNs);
+            sqlite3_bind_int64(
+                insert.get(),
+                8,
+                static_cast<sqlite3_int64>(segment->speakerId));
+            bindText(insert.get(), 9, segment->speakerLabel);
+            bindText(insert.get(), 10, segment->text);
+            bindText(insert.get(), 11, segment->language);
+            sqlite3_bind_double(insert.get(), 12, segment->confidence);
+            sqlite3_bind_int64(insert.get(), 13, segment->flags);
+            sqlite3_bind_int64(
+                insert.get(),
+                14,
+                static_cast<sqlite3_int64>(checkpoint));
+            bindText(insert.get(), 15, segment->speakerEmbeddingModel);
+            sqlite3_bind_int64(
+                insert.get(),
+                16,
+                static_cast<sqlite3_int64>(
+                    segment->speakerEmbedding.size()));
+            bindEmbedding(insert.get(), 17, segment->speakerEmbedding);
+            if (auto inserted = stepDone(database_, insert.get()); !inserted) {
+                return inserted.error();
+            }
+        }
+    }
+
+    std::vector<TranscriptSegment> visibleCandidates;
+    std::vector<std::uint64_t> groupsToResolve;
+    for (const auto &item : resolutionWork) {
+        if (!item.unresolved) {
+            continue;
+        }
+        auto resolved = resolvePendingPayload(
+            database_,
+            sessionId,
+            item.resolution->groupId,
+            item.resolution->attributions);
+        if (!resolved) {
+            return resolved.error();
+        }
+        for (auto &segment : resolved.value()) {
+            segment.journalCheckpoint = checkpoint;
+            visibleCandidates.push_back(std::move(segment));
+        }
+        groupsToResolve.push_back(item.resolution->groupId);
+    }
+    for (auto &commit : commitWork) {
+        commit.journalCheckpoint = checkpoint;
+        visibleCandidates.push_back(std::move(commit));
+    }
+
+    std::vector<TranscriptSegment> normalizedVisible;
+    for (auto &candidate : visibleCandidates) {
+        const auto duplicate = std::find_if(
+            normalizedVisible.begin(),
+            normalizedVisible.end(),
+            [&](const TranscriptSegment &existing) {
+                return existing.stableId == candidate.stableId
+                    && existing.revision == candidate.revision;
+            });
+        if (duplicate == normalizedVisible.end()) {
+            normalizedVisible.push_back(std::move(candidate));
+        } else if (!sameSegmentPayload(*duplicate, candidate)) {
+            return Error{
+                LS_CONFLICT,
+                "diarization batch publishes conflicting segment content"};
+        }
+    }
+    std::sort(
+        normalizedVisible.begin(),
+        normalizedVisible.end(),
+        [](const TranscriptSegment &left, const TranscriptSegment &right) {
+            if (left.stableId != right.stableId) {
+                return left.stableId < right.stableId;
+            }
+            return left.revision < right.revision;
+        });
+
+    for (auto &candidate : normalizedVisible) {
+        auto exact = loadVisibleSegmentRevision(
+            database_,
+            sessionId,
+            candidate.stableId,
+            candidate.revision);
+        if (!exact) {
+            return exact.error();
+        }
+        if (exact.value().has_value()) {
+            auto effectiveExisting = applySpeakerEnrollment(
+                database_,
+                sessionId,
+                *exact.value());
+            if (!effectiveExisting) {
+                return effectiveExisting.error();
+            }
+            if (!sameSegmentPayload(
+                    effectiveExisting.value(),
+                    candidate)) {
+                return Error{
+                    LS_CONFLICT,
+                    "same segment revision has different content"};
+            }
+            continue;
+        }
+        auto latest = loadLatestVisibleSegment(
+            database_,
+            sessionId,
+            candidate.stableId);
+        if (!latest) {
+            return latest.error();
+        }
+        if (latest.value().has_value()
+            && latest.value()->revision > candidate.revision) {
+            return Error{
+                LS_CONFLICT,
+                "segment revision would move backwards"};
+        }
+        if (auto inserted = insertVisibleSegment(
+                database_,
+                sessionId,
+                candidate,
+                checkpoint);
+            !inserted) {
+            return inserted.error();
+        }
+        result.highestSegmentRevision = std::max(
+            result.highestSegmentRevision,
+            candidate.revision);
+        result.visibleSegments.push_back(candidate);
+    }
+
+    for (const auto groupId : groupsToResolve) {
+        Statement resolve;
+        auto prepared = prepare(
+            database_,
+            "UPDATE pending_speaker_groups SET resolved_checkpoint = ? "
+            "WHERE session_id = ? AND group_id = ? "
+            "AND resolved_checkpoint IS NULL",
+            resolve);
+        if (!prepared) {
+            return prepared.error();
+        }
+        sqlite3_bind_int64(
+            resolve.get(),
+            1,
+            static_cast<sqlite3_int64>(checkpoint));
+        bindText(resolve.get(), 2, sessionId);
+        sqlite3_bind_int64(
+            resolve.get(),
+            3,
+            static_cast<sqlite3_int64>(groupId));
+        if (auto resolved = stepDone(database_, resolve.get()); !resolved) {
+            return resolved.error();
+        }
+        if (sqlite3_changes(database_) != 1) {
+            return Error{
+                LS_CONFLICT,
+                "pending speaker group resolution lost a race"};
+        }
+    }
+
+    Statement update;
+    const bool published = !result.visibleSegments.empty();
+    auto prepared = published
+        ? prepare(
+              database_,
+              "UPDATE sessions SET journal_checkpoint = ?, "
+              "highest_segment_revision = MAX(highest_segment_revision, ?), "
+              "timeline_origin_ns = CASE "
+              "WHEN timeline_origin_ns = 0 OR timeline_origin_ns > ? THEN ? "
+              "ELSE timeline_origin_ns END WHERE session_id = ?",
+              update)
+        : prepare(
+              database_,
+              "UPDATE sessions SET journal_checkpoint = ? "
+              "WHERE session_id = ?",
+              update);
+    if (!prepared) {
+        return prepared.error();
+    }
+    sqlite3_bind_int64(
+        update.get(),
+        1,
+        static_cast<sqlite3_int64>(checkpoint));
+    if (published) {
+        const auto timelineOrigin = std::min_element(
+            result.visibleSegments.begin(),
+            result.visibleSegments.end(),
+            [](const TranscriptSegment &left, const TranscriptSegment &right) {
+                return left.startTimeNs < right.startTimeNs;
+            })->startTimeNs;
+        sqlite3_bind_int64(
+            update.get(),
+            2,
+            result.highestSegmentRevision);
+        sqlite3_bind_int64(update.get(), 3, timelineOrigin);
+        sqlite3_bind_int64(update.get(), 4, timelineOrigin);
+        bindText(update.get(), 5, sessionId);
+    } else {
+        bindText(update.get(), 2, sessionId);
+    }
+    if (auto updated = stepDone(database_, update.get()); !updated) {
+        return updated.error();
+    }
+    if (auto committed = transaction.commit(); !committed) {
+        return committed.error();
+    }
+    result.journalCheckpoint = checkpoint;
+    result.wasChanged = true;
+    std::sort(
+        result.visibleSegments.begin(),
+        result.visibleSegments.end(),
+        [](const TranscriptSegment &left, const TranscriptSegment &right) {
+            if (left.startTimeNs != right.startTimeNs) {
+                return left.startTimeNs < right.startTimeNs;
+            }
+            if (left.endTimeNs != right.endTimeNs) {
+                return left.endTimeNs < right.endTimeNs;
+            }
+            if (left.sourceId != right.sourceId) {
+                return left.sourceId < right.sourceId;
+            }
+            if (left.stableId != right.stableId) {
+                return left.stableId < right.stableId;
+            }
+            return left.revision < right.revision;
+        });
+    return result;
+}
+
+Expected<DiarizationJournalBatchResult>
+RecoveryJournal::stagePendingSegments(
+    const std::string &sessionId,
+    std::uint64_t groupId,
+    std::int64_t deadlineMonotonicNs,
+    std::span<const TranscriptSegment> fallbackSegments)
+{
+    DiarizationJournalBatch batch;
+    batch.holds.push_back(PendingSpeakerGroupStage{
+        groupId,
+        deadlineMonotonicNs,
+        std::vector<TranscriptSegment>(
+            fallbackSegments.begin(),
+            fallbackSegments.end())});
+    return applyDiarizationBatch(sessionId, batch);
+}
+
+Expected<DiarizationJournalBatchResult>
+RecoveryJournal::resolvePendingSpeakerGroup(
+    const std::string &sessionId,
+    std::uint64_t groupId,
+    std::span<const SpeakerTurn> attributions)
+{
+    DiarizationJournalBatch batch;
+    batch.resolutions.push_back(PendingSpeakerGroupResolution{
+        groupId,
+        std::vector<SpeakerTurn>(attributions.begin(), attributions.end())});
+    return applyDiarizationBatch(sessionId, batch);
+}
+
+Expected<DiarizationJournalBatchResult>
+RecoveryJournal::resolveAllPendingSpeakerGroupsToFallback(
+    const std::string &sessionId)
+{
+    return applyDiarizationBatchImpl(sessionId, {}, true);
 }
 
 Expected<std::uint64_t> RecoveryJournal::recordSourceEvent(
@@ -2291,7 +3475,8 @@ RecoveryJournal::markAndListRecoverableSessions()
     Statement candidates;
     auto prepared = prepare(
         database_,
-        "SELECT session_id, phase, journal_checkpoint FROM sessions "
+        "SELECT session_id, phase, journal_checkpoint, "
+        "highest_segment_revision, timeline_origin_ns FROM sessions "
         "WHERE phase IN (?, ?, ?, ?) ORDER BY session_id",
         candidates);
     if (!prepared) {
@@ -2306,6 +3491,8 @@ RecoveryJournal::markAndListRecoverableSessions()
         std::string id;
         ls_phase_t phase{};
         std::uint64_t checkpoint{};
+        std::uint32_t highestSegmentRevision{};
+        std::int64_t timelineOriginNs{};
     };
     std::vector<Candidate> rows;
     int step = SQLITE_ROW;
@@ -2314,13 +3501,187 @@ RecoveryJournal::markAndListRecoverableSessions()
             columnText(candidates.get(), 0),
             sqlite3_column_int(candidates.get(), 1),
             static_cast<std::uint64_t>(
-                sqlite3_column_int64(candidates.get(), 2))});
+                sqlite3_column_int64(candidates.get(), 2)),
+            static_cast<std::uint32_t>(
+                sqlite3_column_int64(candidates.get(), 3)),
+            sqlite3_column_int64(candidates.get(), 4)});
     }
     if (step != SQLITE_DONE) {
         return sqliteError(database_, "cannot discover recoverable sessions");
     }
 
     for (const auto &candidate : rows) {
+        if (candidate.checkpoint
+            == std::numeric_limits<std::uint64_t>::max()) {
+            return Error{
+                LS_CONFLICT,
+                "journal checkpoint space is exhausted during recovery"};
+        }
+        const std::uint64_t recoveryCheckpoint = candidate.checkpoint + 1u;
+
+        Statement unresolvedGroups;
+        prepared = prepare(
+            database_,
+            "SELECT group_id FROM pending_speaker_groups "
+            "WHERE session_id = ? AND resolved_checkpoint IS NULL "
+            "ORDER BY deadline_monotonic_ns, group_id",
+            unresolvedGroups);
+        if (!prepared) {
+            return prepared.error();
+        }
+        bindText(unresolvedGroups.get(), 1, candidate.id);
+        std::vector<std::uint64_t> groupIds;
+        int groupStep = SQLITE_ROW;
+        while ((groupStep = sqlite3_step(unresolvedGroups.get()))
+               == SQLITE_ROW) {
+            const auto groupId = static_cast<std::uint64_t>(
+                sqlite3_column_int64(unresolvedGroups.get(), 0));
+            if (groupId == 0
+                || groupId
+                    > static_cast<std::uint64_t>(
+                        std::numeric_limits<sqlite3_int64>::max())) {
+                return Error{
+                    LS_RECOVERY_ERROR,
+                    "journal has an invalid pending speaker group"};
+            }
+            groupIds.push_back(groupId);
+        }
+        if (groupStep != SQLITE_DONE) {
+            return sqliteError(
+                database_,
+                "cannot discover pending recovery groups");
+        }
+
+        std::vector<TranscriptSegment> fallbackSegments;
+        for (const auto groupId : groupIds) {
+            auto fallback = resolvePendingPayload(
+                database_,
+                candidate.id,
+                groupId,
+                {});
+            if (!fallback) {
+                return fallback.error();
+            }
+            for (auto &segment : fallback.value()) {
+                segment.journalCheckpoint = recoveryCheckpoint;
+                const auto duplicate = std::find_if(
+                    fallbackSegments.begin(),
+                    fallbackSegments.end(),
+                    [&](const TranscriptSegment &existing) {
+                        return existing.stableId == segment.stableId
+                            && existing.revision == segment.revision;
+                    });
+                if (duplicate == fallbackSegments.end()) {
+                    fallbackSegments.push_back(std::move(segment));
+                } else if (!sameSegmentPayload(*duplicate, segment)) {
+                    return Error{
+                        LS_RECOVERY_ERROR,
+                        "pending recovery groups have conflicting payload"};
+                }
+            }
+        }
+        std::sort(
+            fallbackSegments.begin(),
+            fallbackSegments.end(),
+            [](const TranscriptSegment &left,
+               const TranscriptSegment &right) {
+                if (left.stableId != right.stableId) {
+                    return left.stableId < right.stableId;
+                }
+                return left.revision < right.revision;
+            });
+
+        std::uint32_t highestRevision =
+            candidate.highestSegmentRevision;
+        std::int64_t timelineOrigin = candidate.timelineOriginNs;
+        bool insertedFallback = false;
+        for (const auto &fallback : fallbackSegments) {
+            auto exact = loadVisibleSegmentRevision(
+                database_,
+                candidate.id,
+                fallback.stableId,
+                fallback.revision);
+            if (!exact) {
+                return exact.error();
+            }
+            if (exact.value().has_value()) {
+                auto effectiveExisting = applySpeakerEnrollment(
+                    database_,
+                    candidate.id,
+                    *exact.value());
+                if (!effectiveExisting) {
+                    return effectiveExisting.error();
+                }
+                if (!sameSegmentPayload(
+                        effectiveExisting.value(),
+                        fallback)) {
+                    return Error{
+                        LS_RECOVERY_ERROR,
+                        "pending fallback conflicts with visible segment"};
+                }
+                continue;
+            }
+            auto latest = loadLatestVisibleSegment(
+                database_,
+                candidate.id,
+                fallback.stableId);
+            if (!latest) {
+                return latest.error();
+            }
+            if (latest.value().has_value()
+                && latest.value()->revision > fallback.revision) {
+                return Error{
+                    LS_RECOVERY_ERROR,
+                    "pending fallback revision is older than visible segment"};
+            }
+            if (auto inserted = insertVisibleSegment(
+                    database_,
+                    candidate.id,
+                    fallback,
+                    recoveryCheckpoint);
+                !inserted) {
+                return inserted.error();
+            }
+            insertedFallback = true;
+            highestRevision = std::max(
+                highestRevision,
+                fallback.revision);
+            if (timelineOrigin == 0
+                || timelineOrigin > fallback.startTimeNs) {
+                timelineOrigin = fallback.startTimeNs;
+            }
+        }
+
+        if (!groupIds.empty()) {
+            Statement resolveGroups;
+            prepared = prepare(
+                database_,
+                "UPDATE pending_speaker_groups "
+                "SET resolved_checkpoint = ? "
+                "WHERE session_id = ? AND resolved_checkpoint IS NULL",
+                resolveGroups);
+            if (!prepared) {
+                return prepared.error();
+            }
+            sqlite3_bind_int64(
+                resolveGroups.get(),
+                1,
+                static_cast<sqlite3_int64>(recoveryCheckpoint));
+            bindText(resolveGroups.get(), 2, candidate.id);
+            if (auto resolved = stepDone(
+                    database_,
+                    resolveGroups.get());
+                !resolved) {
+                return resolved.error();
+            }
+            if (sqlite3_changes(database_)
+                != static_cast<int>(groupIds.size())) {
+                return Error{
+                    LS_CONFLICT,
+                    "pending recovery group resolution lost a race"};
+            }
+        }
+
         Statement sequence;
         prepared = prepare(
             database_,
@@ -2337,18 +3698,37 @@ RecoveryJournal::markAndListRecoverableSessions()
         const auto eventSequence = sqlite3_column_int64(sequence.get(), 0);
 
         Statement update;
-        prepared = prepare(
-            database_,
-            "UPDATE sessions SET phase = ?, recovery_marked = 1, "
-            "journal_checkpoint = journal_checkpoint + 1 "
-            "WHERE session_id = ? AND phase = ?",
-            update);
+        prepared = insertedFallback
+            ? prepare(
+                  database_,
+                  "UPDATE sessions SET phase = ?, recovery_marked = 1, "
+                  "journal_checkpoint = ?, highest_segment_revision = ?, "
+                  "timeline_origin_ns = ? "
+                  "WHERE session_id = ? AND phase = ?",
+                  update)
+            : prepare(
+                  database_,
+                  "UPDATE sessions SET phase = ?, recovery_marked = 1, "
+                  "journal_checkpoint = ? "
+                  "WHERE session_id = ? AND phase = ?",
+                  update);
         if (!prepared) {
             return prepared.error();
         }
         sqlite3_bind_int(update.get(), 1, LS_PHASE_RECOVERY_REQUIRED);
-        bindText(update.get(), 2, candidate.id);
-        sqlite3_bind_int(update.get(), 3, candidate.phase);
+        sqlite3_bind_int64(
+            update.get(),
+            2,
+            static_cast<sqlite3_int64>(recoveryCheckpoint));
+        if (insertedFallback) {
+            sqlite3_bind_int64(update.get(), 3, highestRevision);
+            sqlite3_bind_int64(update.get(), 4, timelineOrigin);
+            bindText(update.get(), 5, candidate.id);
+            sqlite3_bind_int(update.get(), 6, candidate.phase);
+        } else {
+            bindText(update.get(), 3, candidate.id);
+            sqlite3_bind_int(update.get(), 4, candidate.phase);
+        }
         if (auto stepped = stepDone(database_, update.get()); !stepped) {
             return stepped.error();
         }

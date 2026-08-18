@@ -114,7 +114,11 @@ typedef struct {
 The same contract represents live and final processing. Partial segments may be
 delivered to the UI but are never journaled as durable transcript content and
 never rendered to Markdown. A higher revision supersedes a lower revision of
-the same stable ID inside a transaction.
+the same stable ID inside a transaction. A Final ASR hypothesis held by
+inertial diarization is not yet an `ls_transcript_segment_v1`: it remains in
+private durable staging until its whole pending group is promoted with either
+the confirmed or saved fallback attribution. This internal state adds no public
+ABI value or correction event.
 
 ## Lifecycle functions
 
@@ -189,7 +193,10 @@ Rules:
 - event payloads never contain raw audio;
 - queue overflow is itself a durable error/metrics event. Partial events may be
   coalesced; state, final segment, source loss, and terminal events may not be
-  coalesced away.
+  coalesced away;
+- diarization `hold` and `resolve` operations are not event kinds. A held Final
+  Segment enters the public queue and committed-segment metrics only after the
+  corresponding pending group has been atomically promoted.
 
 `ls_session_copy_state_v1` reads the authoritative lifecycle state under the
 core state lock without consuming the event queue. Swift uses it immediately
@@ -211,7 +218,7 @@ the `preparing` session with `cancelled`. This is durably recorded as
 
 ## Rendering and recovery
 
-Rendering consumes a committed immutable journal snapshot:
+Rendering consumes the visible part of a committed immutable journal snapshot:
 
 ```c
 typedef struct {
@@ -255,7 +262,11 @@ compatible and discards this token.
 
 A live recording render reads committed state immediately; it does not wait
 for accepted ASR work to drain. Pause and finalization own their explicit drain
-barriers. The Markdown bytes have no output path and perform no filesystem I/O.
+barriers. Hidden pending groups and their staged Final Segment payloads are
+excluded from transcript rows, participants, and Markdown. Staging may advance
+`journal_checkpoint` without advancing `highest_segment_revision` or changing
+the rendered transcript bytes; promotion advances the visible values together.
+The Markdown bytes have no output path and perform no filesystem I/O.
 Final transcript segments and capture diagnostics use separate owned ranges:
 `<!-- transcript:start -->` / `<!-- transcript:end -->` and
 `<!-- capture-events:start -->` / `<!-- capture-events:end -->`. The capture
@@ -293,10 +304,11 @@ terminal snapshot.
 The C facade exposes core-scoped list, enroll, rename, and delete operations.
 Enrollment accepts a durable session ID, an anonymous remote `speaker_id`, and a
 UTF-8 display name. It does not accept raw audio or descriptor bytes from Swift:
-the core derives a bounded profile from embeddings already committed with that
-session's final segments. The result returns the persistent profile/speaker IDs,
-observation count, relabeled-segment count, and exact render checkpoint needed
-to republish the selected call.
+the core derives a bounded profile only from embeddings attached to visible,
+committed Final Segments. Descriptors in a hidden pending group do not affect
+profile observations, participant queries, or relabeling. The result returns the
+persistent profile/speaker IDs, observation count, relabeled-segment count, and
+exact render checkpoint needed to republish the selected call.
 
 Profile-list values expose only profile ID, display name, and observation count.
 Centroids, prototypes, embedding dimensions, and embedding model/version remain
@@ -325,24 +337,58 @@ public:
     virtual ~IAsrBackend() = default;
     virtual BackendInfo info() const = 0;
     virtual Expected<void> prepare(const AsrConfiguration&) = 0;
-    virtual Expected<std::vector<AsrHypothesis>>
+    virtual Expected<std::vector<AsrTimelineBatch>>
         accept(const AudioWindow&) = 0;
-    virtual Expected<std::vector<AsrHypothesis>> flush() = 0;
+    virtual Expected<std::vector<AsrTimelineBatch>> flush() = 0;
+    virtual void requestAbort() noexcept {}
 };
 
 class IDiarizationBackend {
 public:
     virtual ~IDiarizationBackend() = default;
     virtual BackendInfo info() const = 0;
-    virtual Expected<std::vector<SpeakerTurn>>
-        assign(const AudioWindow&, std::span<const AsrHypothesis>) = 0;
-    virtual Expected<std::vector<SpeakerTurn>> flush() = 0;
+    virtual Expected<void> prepare(const DiarizationConfiguration&) = 0;
+    virtual Expected<DiarizationUpdate>
+        assign(const AsrTimelineBatch&) = 0;
+    virtual Expected<DiarizationUpdate>
+        flush(DiarizationFlushReason reason) = 0;
 };
 ```
+
+`AsrTimelineBatch` carries `sourceId`, the actually decoded interval
+`processedStartTimeNs...finalizedThroughTimeNs`, `discontinuityBefore`, and an
+ordered hypothesis vector. A backend emits a batch only after that interval has
+been fully processed. An empty batch for decoded silence is meaningful; raw
+audio still buffered by ASR and wall-clock progress must not advance the decoded
+watermark. Watermarks are per source, and only fully processed System Audio
+advances the five-second deadline for a pending remote-speaker switch. Batches
+from different sources may interleave; microphone or wall-clock progress must
+never be treated as a substitute System Audio watermark.
+
+`DiarizationUpdate` contains one ordered `SpeakerTurnDecision` for every input
+hypothesis plus zero or more whole-group resolutions. A decision is either
+`commit`, which is ready for normal visible persistence, or `hold`, which names
+a bounded pending group and its deadline. A resolution is the internal
+`resolve`: it supplies every staged revision in that group with either the
+confirmed attribution or the persisted fallback attribution. The session must
+apply staging or whole-group promotion atomically. It classifies all hypotheses
+in a batch before applying that batch's decoded watermark, so evidence ending
+exactly at the deadline can still confirm a switch.
+
+`flush(DiarizationFlushReason::pause)` and
+`flush(DiarizationFlushReason::endOfStream)` resolve every remaining group to
+its saved fallback. Pause and terminal finalization first drain accepted audio,
+process every ASR tail batch, then flush diarization; neither boundary may leave
+a pending group alive. On recovery the speculative target is intentionally not
+reconstructed: durable pending groups are fallback-promoted before the session
+is marked `recovery_required`.
 
 Contracts:
 
 - input timestamps remain on the LocalScribe monotonic timeline;
+- ASR batches preserve per-source decode order, including empty silence and
+  discontinuity boundaries; capture timestamps alone never expire diarization
+  evidence;
 - whisper input conversion keeps a rational sample-rate remainder and FIR
   history per source across capture callbacks; a discontinuity, rate change, or
   EOS finishes and resets only that source, preventing callback-floor drift

@@ -67,6 +67,22 @@ std::int64_t saturatedTimestamp(
     return base + units * kWhisperTimestampUnitNs;
 }
 
+std::int64_t saturatedAudioEnd(
+    std::int64_t startTimeNs,
+    std::size_t sampleCount)
+{
+    const long double durationNs =
+        static_cast<long double>(sampleCount) * 1'000'000'000.0L
+        / static_cast<long double>(kWhisperSampleRate);
+    const long double available =
+        static_cast<long double>(std::numeric_limits<std::int64_t>::max())
+        - static_cast<long double>(startTimeNs);
+    if (durationNs >= available) {
+        return std::numeric_limits<std::int64_t>::max();
+    }
+    return startTimeNs + static_cast<std::int64_t>(durationNs);
+}
+
 StableId stableId(
     std::uint64_t sourceId,
     std::uint64_t chunk,
@@ -233,11 +249,7 @@ public:
         return true;
     }
 
-    Expected<std::vector<AsrHypothesis>> transcribe(
-        std::uint64_t sourceId,
-        std::int64_t startTimeNs,
-        std::uint64_t chunkOrdinal,
-        std::span<const float> samples)
+    Expected<AsrTimelineBatch> transcribe(const WhisperChunk &chunk)
     {
         if (context == nullptr) {
             return Error{LS_INVALID_STATE, "whisper.cpp is not prepared"};
@@ -247,23 +259,32 @@ public:
                 LS_TIMEOUT,
                 "whisper.cpp inference cancelled for bounded finalization"};
         }
+
+        AsrTimelineBatch batch;
+        batch.sourceId = chunk.sourceId;
+        batch.processedStartTimeNs = chunk.startTimeNs;
+        batch.finalizedThroughTimeNs = saturatedAudioEnd(
+            chunk.startTimeNs,
+            chunk.samples.size());
+        batch.discontinuityBefore = chunk.discontinuityBefore;
+
         if (!speechGate.shouldTranscribe(
-                sourceId,
-                samples,
+                chunk.sourceId,
+                chunk.samples,
                 kWhisperSampleRate)) {
-            return std::vector<AsrHypothesis>{};
+            return batch;
         }
         const float peak = std::accumulate(
-            samples.begin(),
-            samples.end(),
+            chunk.samples.begin(),
+            chunk.samples.end(),
             0.0F,
             [](float current, float sample) {
                 return std::max(current, std::fabs(sample));
             });
         if (peak < 0.001F) {
-            return std::vector<AsrHypothesis>{};
+            return batch;
         }
-        if (samples.size()
+        if (chunk.samples.size()
             > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
             return Error{LS_BACKEND_FAILURE, "ASR chunk is too large"};
         }
@@ -306,8 +327,8 @@ public:
             return whisper_full(
                 context,
                 parameters,
-                samples.data(),
-                static_cast<int>(samples.size()));
+                chunk.samples.data(),
+                static_cast<int>(chunk.samples.size()));
         };
         int inferenceStatus = runInference();
         if (inferenceStatus != 0
@@ -333,8 +354,8 @@ public:
         }
 
         const int count = whisper_full_n_segments(context);
-        std::vector<AsrHypothesis> result;
-        result.reserve(count > 0 ? static_cast<std::size_t>(count) : 0u);
+        batch.hypotheses.reserve(
+            count > 0 ? static_cast<std::size_t>(count) : 0u);
         for (int index = 0; index < count; ++index) {
             const char *raw = whisper_full_get_segment_text(context, index);
             std::string text = trim(raw == nullptr ? "" : raw);
@@ -353,16 +374,22 @@ public:
 
             AsrHypothesis hypothesis;
             hypothesis.stableId = stableId(
-                sourceId,
-                chunkOrdinal,
+                chunk.sourceId,
+                chunk.ordinal,
                 static_cast<std::uint32_t>(index));
-            hypothesis.sourceId = sourceId;
-            hypothesis.startTimeNs = saturatedTimestamp(
-                startTimeNs,
-                whisper_full_get_segment_t0(context, index));
-            hypothesis.endTimeNs = saturatedTimestamp(
-                startTimeNs,
-                whisper_full_get_segment_t1(context, index));
+            hypothesis.sourceId = chunk.sourceId;
+            hypothesis.startTimeNs = std::clamp(
+                saturatedTimestamp(
+                    chunk.startTimeNs,
+                    whisper_full_get_segment_t0(context, index)),
+                batch.processedStartTimeNs,
+                batch.finalizedThroughTimeNs);
+            hypothesis.endTimeNs = std::clamp(
+                saturatedTimestamp(
+                    chunk.startTimeNs,
+                    whisper_full_get_segment_t1(context, index)),
+                hypothesis.startTimeNs,
+                batch.finalizedThroughTimeNs);
             hypothesis.text = std::move(text);
             hypothesis.language = detectedLanguage;
             hypothesis.confidence =
@@ -375,14 +402,14 @@ public:
                     context,
                     index);
             const auto begin = std::min<std::size_t>(
-                samples.size(),
+                chunk.samples.size(),
                 static_cast<std::size_t>(
                     std::max<std::int64_t>(
                         whisper_full_get_segment_t0(context, index),
                         0))
                     * kWhisperSampleRate / 100u);
             const auto end = std::min<std::size_t>(
-                samples.size(),
+                chunk.samples.size(),
                 static_cast<std::size_t>(
                     std::max<std::int64_t>(
                         whisper_full_get_segment_t1(context, index),
@@ -391,16 +418,18 @@ public:
             if (end > begin) {
                 hypothesis.speakerEmbedding =
                     SpeakerFeatureExtractor::extract(
-                        samples.subspan(begin, end - begin),
+                        std::span<const float>(chunk.samples).subspan(
+                            begin,
+                            end - begin),
                         kWhisperSampleRate);
                 if (!hypothesis.speakerEmbedding.empty()) {
                     hypothesis.speakerEmbeddingModel =
                         std::string{kSpeakerFeatureModelId};
                 }
             }
-            result.push_back(std::move(hypothesis));
+            batch.hypotheses.push_back(std::move(hypothesis));
         }
-        return result;
+        return batch;
     }
 
     whisper_context *context{};
@@ -486,7 +515,7 @@ WhisperCppBackend::prepare(const AsrConfiguration &configuration)
     return success();
 }
 
-Expected<std::vector<AsrHypothesis>>
+Expected<std::vector<AsrTimelineBatch>>
 WhisperCppBackend::accept(const AudioWindow &audio)
 {
     if (impl_->context == nullptr) {
@@ -521,7 +550,7 @@ WhisperCppBackend::accept(const AudioWindow &audio)
         (audio.flags & LS_AUDIO_FLAG_DISCONTINUITY) != 0,
         (audio.flags & LS_AUDIO_FLAG_END_OF_STREAM) != 0,
         audio.overloadGapBefore);
-    std::vector<AsrHypothesis> result;
+    std::vector<AsrTimelineBatch> result;
     for (const auto &block : blocks) {
         auto chunks = impl_->chunker.accept(
             block.sourceId,
@@ -531,29 +560,22 @@ WhisperCppBackend::accept(const AudioWindow &audio)
             block.endOfStream,
             block.dropShortBeforeDiscontinuity);
         for (const auto &chunk : chunks) {
-            auto transcription = impl_->transcribe(
-                chunk.sourceId,
-                chunk.startTimeNs,
-                chunk.ordinal,
-                chunk.samples);
+            auto transcription = impl_->transcribe(chunk);
             if (!transcription) {
                 return transcription.error();
             }
-            result.insert(
-                result.end(),
-                std::make_move_iterator(transcription.value().begin()),
-                std::make_move_iterator(transcription.value().end()));
+            result.push_back(transcription.takeValue());
         }
     }
     return result;
 }
 
-Expected<std::vector<AsrHypothesis>> WhisperCppBackend::flush()
+Expected<std::vector<AsrTimelineBatch>> WhisperCppBackend::flush()
 {
     if (impl_->context == nullptr) {
         return Error{LS_INVALID_STATE, "whisper.cpp is not prepared"};
     }
-    std::vector<AsrHypothesis> result;
+    std::vector<AsrTimelineBatch> result;
     for (const auto &block : impl_->resampler.flush()) {
         auto chunks = impl_->chunker.accept(
             block.sourceId,
@@ -563,33 +585,19 @@ Expected<std::vector<AsrHypothesis>> WhisperCppBackend::flush()
             block.endOfStream,
             block.dropShortBeforeDiscontinuity);
         for (const auto &chunk : chunks) {
-            auto transcription = impl_->transcribe(
-                chunk.sourceId,
-                chunk.startTimeNs,
-                chunk.ordinal,
-                chunk.samples);
+            auto transcription = impl_->transcribe(chunk);
             if (!transcription) {
                 return transcription.error();
             }
-            result.insert(
-                result.end(),
-                std::make_move_iterator(transcription.value().begin()),
-                std::make_move_iterator(transcription.value().end()));
+            result.push_back(transcription.takeValue());
         }
     }
     for (const auto &chunk : impl_->chunker.flush()) {
-        auto transcription = impl_->transcribe(
-            chunk.sourceId,
-            chunk.startTimeNs,
-            chunk.ordinal,
-            chunk.samples);
+        auto transcription = impl_->transcribe(chunk);
         if (!transcription) {
             return transcription.error();
         }
-        result.insert(
-            result.end(),
-            std::make_move_iterator(transcription.value().begin()),
-            std::make_move_iterator(transcription.value().end()));
+        result.push_back(transcription.takeValue());
     }
     return result;
 }

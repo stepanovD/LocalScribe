@@ -140,13 +140,14 @@ The default diarization backend is source- and acoustics-aware:
   anonymous speakers per session, clustered from trimmed per-segment spectral
   voice descriptors using bounded robust centroids and multiple recent
   prototypes;
-- gray-zone acoustic changes remain provisional until a second consistent
-  segment either expands the current voice profile or confirms a new speaker;
+- all ambiguous acoustic changes use the inertial switch policy defined by
+  [ADR-0005](ADR-0005-inertial-speaker-switches.md); held Final Segments remain
+  private until confirmation or fallback;
 - a single acoustic outlier cannot create a new anonymous speaker;
 - acoustically unstable short segments use temporal or turn-hint continuity
   instead of creating noisy new identities;
-- compatible `*-tdrz` whisper.cpp models → additional explicit speaker-turn
-  hints.
+- compatible `*-tdrz` whisper.cpp models → additional speaker-turn hints that
+  cannot confirm a switch without usable acoustic evidence.
 
 The legacy source-aware backend remains available for deterministic tests and
 compatibility. Persistent profiles occupy a speaker-ID namespace distinct from
@@ -185,14 +186,19 @@ SQLite is the canonical recovery store. Markdown is a deterministic projection,
 not the database.
 
 The journal uses WAL mode, foreign keys, explicit schema versioning, and
-transactions. A final segment is eligible for Markdown publication only after
-its current revision is committed. The same versioned local store owns voice
+transactions. A final ASR hypothesis may be durably staged while an ambiguous
+speaker switch is unresolved. It becomes eligible for events and Markdown only
+after its speaker attribution is atomically promoted into visible segments, as
+defined by [ADR-0005](ADR-0005-inertial-speaker-switches.md). The same
+versioned local store owns voice
 profile metadata and bounded descriptors so they survive process and session
 restarts independently of capture recovery. Enrollment and relabeling are one
 transaction; a crash cannot expose a profile whose selected call was only
 partly relabeled. The journal stores no raw audio by default; therefore recovery
-guarantees all committed final segments but may lose the unfinalized inference
-tail at a crash. This limitation is surfaced as `interrupted`.
+guarantees all committed final segments and all durably staged final ASR text;
+staged text is recovered under its saved fallback speaker. It may still lose
+the unfinalized ASR inference tail at a crash. This limitation is surfaced as
+`interrupted`.
 
 There is one canonical internal `phase` in core and SQLite. Markdown exposes
 the smaller Product Reference `status` vocabulary:

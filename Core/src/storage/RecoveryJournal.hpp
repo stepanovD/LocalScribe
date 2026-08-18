@@ -12,6 +12,35 @@ struct sqlite3;
 
 namespace localscribe {
 
+struct PendingSpeakerGroupStage {
+    std::uint64_t groupId{};
+    std::int64_t deadlineMonotonicNs{};
+    std::vector<TranscriptSegment> fallbackSegments;
+};
+
+struct PendingSpeakerGroupResolution {
+    std::uint64_t groupId{};
+    /*
+     * Empty means resolve every held segment with its stored fallback.
+     * SpeakerTurn confidence is decision evidence; promotion keeps the
+     * durable Final Segment confidence staged with the transcript payload.
+     */
+    std::vector<SpeakerTurn> attributions;
+};
+
+struct DiarizationJournalBatch {
+    std::vector<PendingSpeakerGroupStage> holds;
+    std::vector<PendingSpeakerGroupResolution> resolutions;
+    std::vector<TranscriptSegment> commits;
+};
+
+struct DiarizationJournalBatchResult {
+    std::uint64_t journalCheckpoint{};
+    std::uint32_t highestSegmentRevision{};
+    std::vector<TranscriptSegment> visibleSegments;
+    bool wasChanged{};
+};
+
 class RecoveryJournal {
 public:
     RecoveryJournal(const RecoveryJournal &) = delete;
@@ -43,6 +72,28 @@ public:
     appendFinalSegment(
         const std::string &sessionId,
         const TranscriptSegment &segment);
+
+    [[nodiscard]] Expected<DiarizationJournalBatchResult>
+    applyDiarizationBatch(
+        const std::string &sessionId,
+        const DiarizationJournalBatch &batch);
+
+    [[nodiscard]] Expected<DiarizationJournalBatchResult>
+    stagePendingSegments(
+        const std::string &sessionId,
+        std::uint64_t groupId,
+        std::int64_t deadlineMonotonicNs,
+        std::span<const TranscriptSegment> fallbackSegments);
+
+    [[nodiscard]] Expected<DiarizationJournalBatchResult>
+    resolvePendingSpeakerGroup(
+        const std::string &sessionId,
+        std::uint64_t groupId,
+        std::span<const SpeakerTurn> attributions = {});
+
+    [[nodiscard]] Expected<DiarizationJournalBatchResult>
+    resolveAllPendingSpeakerGroupsToFallback(
+        const std::string &sessionId);
 
     [[nodiscard]] Expected<std::uint64_t>
     recordSourceEvent(const std::string &sessionId, const SourceGap &event);
@@ -106,6 +157,12 @@ private:
 
     [[nodiscard]] Expected<VoiceProfile>
     loadVoiceProfileLocked(std::uint64_t profileId);
+
+    [[nodiscard]] Expected<DiarizationJournalBatchResult>
+    applyDiarizationBatchImpl(
+        const std::string &sessionId,
+        const DiarizationJournalBatch &batch,
+        bool resolveAllPendingToFallback);
 
     sqlite3 *database_{};
     std::string path_;

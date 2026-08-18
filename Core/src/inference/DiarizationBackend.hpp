@@ -4,7 +4,6 @@
 #include "../common/Types.hpp"
 
 #include <memory>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,14 +24,15 @@ public:
     [[nodiscard]] virtual BackendInfo info() const = 0;
     [[nodiscard]] virtual Expected<void>
     prepare(const DiarizationConfiguration &configuration) = 0;
-    [[nodiscard]] virtual Expected<std::vector<SpeakerTurn>>
-    assign(
-        const AudioWindow &audio,
-        std::span<const AsrHypothesis> hypotheses) = 0;
-    [[nodiscard]] virtual Expected<std::vector<SpeakerTurn>> flush() = 0;
+    [[nodiscard]] virtual Expected<DiarizationUpdate>
+    assign(const AsrTimelineBatch &batch) = 0;
+    [[nodiscard]] virtual Expected<DiarizationUpdate>
+    flush(DiarizationFlushReason reason) = 0;
 };
 
 [[nodiscard]] Expected<std::unique_ptr<IDiarizationBackend>>
-createDiarizationBackend(std::string_view backendId);
+createDiarizationBackend(
+    std::string_view backendId,
+    bool allowTestBackends = false);
 
 } // namespace localscribe

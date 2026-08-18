@@ -123,18 +123,47 @@ For every persisted transition:
 
 UI state may lag the commit, but may not announce a later state before commit.
 
-For a final segment:
+For each ordered `AsrTimelineBatch`:
 
-1. validate stable ID, time range, source, final flag, and revision;
-2. insert or supersede the segment in an SQLite transaction;
-3. update the journal’s highest committed segment revision;
-4. commit;
-5. enqueue a final-segment event;
-6. coalesce a Markdown snapshot request;
-7. record a publication receipt after atomic publication.
+1. validate its source, decoded interval, discontinuity marker, hypothesis stable
+   IDs, time ranges, final flags, and revisions;
+2. pass the batch to diarization, which classifies every hypothesis before it
+   applies `finalizedThroughTimeNs` as the per-source decoded watermark;
+3. apply the returned `DiarizationUpdate`: a Final Segment marked `commit` is
+   inserted or superseded visibly, while one marked `hold` is stored with its
+   complete payload and saved fallback attribution in a hidden pending group;
+4. apply each whole-group `resolve` atomically, promoting every staged revision
+   with either its confirmed speaker or its persisted fallback speaker;
+5. advance the highest visible revision, timeline origin, committed-segment
+   metrics, and participant/enrollment state only for direct commits and
+   promoted groups;
+6. commit before enqueuing any corresponding Final Segment event;
+7. coalesce a Markdown snapshot request only when visible transcript state
+   changed, then record a publication receipt after atomic publication.
 
-Killing the process between steps 4 and 7 can delay Markdown publication but
-cannot lose the committed segment; recovery re-renders it.
+Staging a pending group advances the journal checkpoint once, but does not
+advance the highest visible revision or timeline origin and does not emit an
+event. Killing the process after private staging cannot lose the Final ASR text;
+recovery promotes it with its fallback attribution before rendering.
+
+## Pending speaker-switch invariant
+
+The confirmation thresholds and fallback conditions are fixed by
+[ADR-0005](ADR-0005-inertial-speaker-switches.md). At most 64 revisions belong
+to one pending group. Until `resolve`, its text,
+descriptor, tentative target, and fallback attribution are absent from public
+segment events, committed-segment metrics, participant queries, Voice Profile
+enrollment, and Markdown. Confirmation or fallback makes the complete group
+visible at one new journal checkpoint, so the first visible segment already has
+its final published speaker and clients never need a correction event.
+
+The five-second hard deadline advances only with
+`AsrTimelineBatch.finalizedThroughTimeNs` for fully processed System Audio. Empty
+batches for decoded silence advance it; raw audio timestamps, buffered audio,
+microphone progress, and wall time do not. Hypotheses are evaluated before the
+same batch's watermark, allowing compatible evidence that ends exactly at the
+deadline to confirm. A discontinuity resolves the group to fallback before the
+new timeline epoch is considered.
 
 ## Source completeness
 
@@ -164,11 +193,14 @@ For the vertical:
 
 ## Pause semantics
 
-- Pause stops accepting new audio and flushes already accepted inference work.
-- Final segments produced from pre-pause audio are journaled normally.
+- Pause stops accepting new audio and drains already accepted inference work.
+- The session flushes the ASR-owned model/chunk tail, applies every returned
+  timeline batch, then calls `flush(DiarizationFlushReason::pause)`.
+- The diarization flush fallback-resolves and atomically promotes every remaining
+  pending group before the `paused` transition is committed.
 - Pause start/end are journal events and create a timeline discontinuity.
 - Time labels remain relative to original session start; paused wall time is
-  not compressed.
+  not compressed and does not advance a decoded-audio deadline.
 - Resume starts new source sequence epochs and marks discontinuity.
 - Start/Resume callbacks remain behind a parked frame barrier until both
   required adapters are ready; Resume journals the elapsed startup gap for
@@ -184,15 +216,25 @@ Finalization is idempotent:
 
 1. reject new frames;
 2. drain accepted queues;
-3. flush ASR and diarization;
-4. commit tail final segments;
-5. compute source completeness;
-6. transition to a terminal phase;
-7. copy the authoritative terminal state directly from core without consuming
+3. flush ASR and process every returned tail `AsrTimelineBatch` through
+   diarization;
+4. call `flush(DiarizationFlushReason::endOfStream)` and fallback-promote every
+   unresolved pending group;
+5. commit all visible tail Final Segments and verify that no pending group
+   remains;
+6. compute source completeness;
+7. transition to a terminal phase;
+8. copy the authoritative terminal state directly from core without consuming
    or timing the event queue;
-8. render from a single committed snapshot;
-9. publish atomically or to staging;
-10. acknowledge the digest/revision.
+9. render from a single committed visible snapshot;
+10. publish atomically or to staging;
+11. acknowledge the digest/revision.
+
+The journal performs a final backend-independent fallback sweep before the
+terminal transition. This preserves staged text even if diarization fails or an
+in-flight assignment is abandoned at the bounded finalization deadline. A late
+backend result is discarded and cannot create a segment after the terminal
+event.
 
 Repeated finalization after a crash must produce byte-identical Markdown for the
 same journal snapshot.
@@ -218,20 +260,27 @@ recovery; capture is never restarted.
 At startup:
 
 1. migrate the journal schema transactionally;
-2. mark nonterminal sessions `recovery_required` once for this recovery
-   attempt, including a session left `finalizing` by an earlier failed attempt;
-3. also select terminal sessions whose receipt does not match their exact
+2. fallback-promote every unresolved durable pending group without attempting to
+   reconstruct the non-persisted speculative target;
+3. only then mark nonterminal sessions `recovery_required` once for this
+   recovery attempt, including a session left `finalizing` by an earlier failed
+   attempt;
+4. also select terminal sessions whose receipt does not match their exact
    checkpoint and highest revision;
-4. finalize `recovery_required` as `interrupted`, while preserving an already
+5. finalize `recovery_required` as `interrupted`, while preserving an already
    committed `complete`, `incomplete_sources`, or `interrupted` phase;
-5. render all committed final revisions with the exact render-snapshot token;
-6. publish to the owned file, staging, or a recovery copy according to file
+6. render all visible committed Final Segment revisions with the exact
+   render-snapshot token;
+7. publish to the owned file, staging, or a recovery copy according to file
    access and conflict state;
-7. acknowledge that exact token only after atomic publication.
+8. acknowledge that exact token only after atomic publication.
 
-The vertical guarantees committed final segments. It does not claim that
-unfinalized model buffers survive a process kill unless a later ADR introduces
-an encrypted raw-audio spool. Stage 0 never resumes capture from recovery.
+The vertical guarantees visible committed Final Segments and durably staged
+Final ASR text. Recovery conservatively attributes the latter to its saved
+fallback speaker; it does not reconstruct speculative acoustic evidence. It
+does not claim that unfinalized model buffers survive a process kill unless a
+later ADR introduces an encrypted raw-audio spool. Stage 0 never resumes capture
+from recovery.
 Every recoverable ID is attempted. A failed row remains the presented
 `recovery_required` result even if later rows succeed; new capture stays
 disabled until **Retry Recovery** re-scans the durable queue and all rows are

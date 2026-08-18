@@ -15,9 +15,9 @@ public:
     [[nodiscard]] virtual BackendInfo info() const = 0;
     [[nodiscard]] virtual Expected<void>
     prepare(const AsrConfiguration &configuration) = 0;
-    [[nodiscard]] virtual Expected<std::vector<AsrHypothesis>>
+    [[nodiscard]] virtual Expected<std::vector<AsrTimelineBatch>>
     accept(const AudioWindow &audio) = 0;
-    [[nodiscard]] virtual Expected<std::vector<AsrHypothesis>> flush() = 0;
+    [[nodiscard]] virtual Expected<std::vector<AsrTimelineBatch>> flush() = 0;
     virtual void requestAbort() noexcept {}
 };
 

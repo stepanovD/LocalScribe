@@ -82,10 +82,14 @@ if(LOCALSCRIBE_BUILD_TESTS)
     add_executable(
         LocalScribeCoreTests
         Core/tests/TestMain.cpp
+        Core/tests/AsrTimelineBatchTests.cpp
         Core/tests/BackendTests.cpp
         Core/tests/ContractTests.cpp
+        Core/tests/DiarizationInertiaTests.cpp
         Core/tests/JournalRecoveryTests.cpp
         Core/tests/MarkdownGoldenTests.cpp
+        Core/tests/PendingJournalTests.cpp
+        Core/tests/SpeakerSwitchContractTests.cpp
         Core/tests/StateMachineTests.cpp
         Core/tests/VoiceProfileTests.cpp)
     target_compile_features(LocalScribeCoreTests PRIVATE cxx_std_20)

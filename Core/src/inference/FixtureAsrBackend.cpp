@@ -43,6 +43,22 @@ std::int64_t durationNs(const AudioWindow &audio)
     return static_cast<std::int64_t>(duration);
 }
 
+std::int64_t durationNs(
+    std::uint32_t frameCount,
+    std::uint32_t sampleRateHz)
+{
+    if (sampleRateHz == 0) {
+        return 0;
+    }
+    const long double duration = static_cast<long double>(frameCount)
+        * 1'000'000'000.0L / static_cast<long double>(sampleRateHz);
+    if (duration
+        >= static_cast<long double>(std::numeric_limits<std::int64_t>::max())) {
+        return std::numeric_limits<std::int64_t>::max();
+    }
+    return static_cast<std::int64_t>(duration);
+}
+
 std::int64_t saturatedAdd(std::int64_t left, std::int64_t right)
 {
     if (right > 0
@@ -50,6 +66,93 @@ std::int64_t saturatedAdd(std::int64_t left, std::int64_t right)
         return std::numeric_limits<std::int64_t>::max();
     }
     return left + right;
+}
+
+struct FixtureCallbackSlice {
+    std::size_t sampleOffset{};
+    std::size_t sampleCount{};
+    std::uint32_t frameOffset{};
+    std::uint32_t frameCount{};
+    std::uint64_t sequenceNumber{};
+    std::int64_t startTimeNs{};
+    std::int64_t endTimeNs{};
+};
+
+std::vector<FixtureCallbackSlice>
+fixtureCallbackSlices(const AudioWindow &audio)
+{
+    const auto singleSlice = [&] {
+        return std::vector<FixtureCallbackSlice>{FixtureCallbackSlice{
+            0,
+            audio.samples.size(),
+            0,
+            audio.frameCount,
+            audio.sequenceNumber,
+            audio.monotonicTimeNs,
+            saturatedAdd(audio.monotonicTimeNs, durationNs(audio))}};
+    };
+
+    if (audio.callbackCount <= 1 || audio.channelCount == 0
+        || audio.callbackCount > audio.frameCount
+        || audio.frameCount % audio.callbackCount != 0) {
+        return singleSlice();
+    }
+
+    const auto framesPerCallback = static_cast<std::uint32_t>(
+        audio.frameCount / audio.callbackCount);
+    const auto samplesPerCallback =
+        static_cast<std::size_t>(framesPerCallback) * audio.channelCount;
+    if (framesPerCallback == 0 || samplesPerCallback == 0
+        || audio.callbackCount
+            > std::numeric_limits<std::size_t>::max() / samplesPerCallback
+        || static_cast<std::size_t>(audio.callbackCount)
+                * samplesPerCallback
+            != audio.samples.size()) {
+        return singleSlice();
+    }
+
+    std::vector<FixtureCallbackSlice> slices;
+    slices.reserve(static_cast<std::size_t>(audio.callbackCount));
+    for (std::uint64_t index = 0; index < audio.callbackCount; ++index) {
+        const auto frameOffset = static_cast<std::uint32_t>(
+            index * framesPerCallback);
+        const auto nextFrameOffset = static_cast<std::uint32_t>(
+            (index + 1u) * framesPerCallback);
+        const auto sequenceNumber =
+            audio.sequenceNumber
+                > std::numeric_limits<std::uint64_t>::max() - index
+            ? std::numeric_limits<std::uint64_t>::max()
+            : audio.sequenceNumber + index;
+        slices.push_back(FixtureCallbackSlice{
+            static_cast<std::size_t>(index) * samplesPerCallback,
+            samplesPerCallback,
+            frameOffset,
+            framesPerCallback,
+            sequenceNumber,
+            saturatedAdd(
+                audio.monotonicTimeNs,
+                durationNs(frameOffset, audio.sampleRateHz)),
+            saturatedAdd(
+                audio.monotonicTimeNs,
+                durationNs(nextFrameOffset, audio.sampleRateHz))});
+    }
+    return slices;
+}
+
+bool fixtureSliceHasSignal(
+    const AudioWindow &audio,
+    const FixtureCallbackSlice &slice)
+{
+    const auto begin = audio.samples.begin()
+        + static_cast<std::ptrdiff_t>(slice.sampleOffset);
+    const auto end = begin + static_cast<std::ptrdiff_t>(slice.sampleCount);
+    const auto peak = std::max_element(
+        begin,
+        end,
+        [](float left, float right) {
+            return std::fabs(left) < std::fabs(right);
+        });
+    return peak != end && std::fabs(*peak) >= 0.001F;
 }
 
 class SlowFixtureAsrBackend final : public IAsrBackend {
@@ -71,14 +174,14 @@ public:
         return fixture_.prepare(configuration);
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>>
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
     accept(const AudioWindow &audio) override
     {
         std::this_thread::sleep_for(delay_);
         return fixture_.accept(audio);
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>> flush() override
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
     {
         return fixture_.flush();
     }
@@ -102,7 +205,7 @@ public:
         return fixture_.prepare(configuration);
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>>
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
     accept(const AudioWindow &audio) override
     {
         for (int attempt = 0; attempt < 1'000; ++attempt) {
@@ -116,9 +219,9 @@ public:
         return fixture_.accept(audio);
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>> flush() override
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
     {
-        return std::vector<AsrHypothesis>{};
+        return std::vector<AsrTimelineBatch>{};
     }
 
     void requestAbort() noexcept override
@@ -145,13 +248,13 @@ public:
         return fixture_.prepare(configuration);
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>>
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
     accept(const AudioWindow &) override
     {
-        return std::vector<AsrHypothesis>{};
+        return std::vector<AsrTimelineBatch>{};
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>> flush() override
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
     {
         for (int attempt = 0; attempt < 1'000; ++attempt) {
             if (aborted_.load(std::memory_order_acquire)) {
@@ -174,6 +277,203 @@ private:
     FixtureAsrBackend fixture_;
 };
 
+class SpeakerFixtureAsrBackend final : public IAsrBackend {
+public:
+    [[nodiscard]] BackendInfo info() const override
+    {
+        return BackendInfo{"fixture-speakers", "1", true};
+    }
+
+    [[nodiscard]] Expected<void>
+    prepare(const AsrConfiguration &configuration) override
+    {
+        return fixture_.prepare(configuration);
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
+    accept(const AudioWindow &audio) override
+    {
+        auto accepted = fixture_.accept(audio);
+        if (!accepted) {
+            return accepted.error();
+        }
+        /*
+         * Test-only speaker encoding, layered over the stable fixture cue:
+         * samples 1...3 are the descriptor and sample 4 is a turn hint.
+         */
+        const auto slices = fixtureCallbackSlices(audio);
+        std::size_t sliceIndex = 0;
+        for (auto &batch : accepted.value()) {
+            for (auto &hypothesis : batch.hypotheses) {
+                while (sliceIndex < slices.size()
+                    && !fixtureSliceHasSignal(
+                        audio,
+                        slices[sliceIndex])) {
+                    ++sliceIndex;
+                }
+                if (sliceIndex == slices.size()) {
+                    continue;
+                }
+                const auto &slice = slices[sliceIndex++];
+                const auto descriptorOffset = slice.sampleOffset + 1u;
+                if (slice.sampleCount >= 4) {
+                    hypothesis.speakerEmbeddingModel =
+                        "fixture-speaker-v1";
+                    hypothesis.speakerEmbedding.assign(
+                        audio.samples.begin()
+                            + static_cast<std::ptrdiff_t>(descriptorOffset),
+                        audio.samples.begin()
+                            + static_cast<std::ptrdiff_t>(
+                                descriptorOffset + 3u));
+                }
+                hypothesis.speakerTurnAfter =
+                    slice.sampleCount >= 5
+                    && audio.samples[slice.sampleOffset + 4u] > 0.5F;
+            }
+        }
+        return accepted.takeValue();
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
+    {
+        return fixture_.flush();
+    }
+
+private:
+    FixtureAsrBackend fixture_;
+};
+
+class BufferedSpeakerFixtureAsrBackend final : public IAsrBackend {
+public:
+    [[nodiscard]] BackendInfo info() const override
+    {
+        return BackendInfo{"fixture-speakers-buffered", "1", true};
+    }
+
+    [[nodiscard]] Expected<void>
+    prepare(const AsrConfiguration &configuration) override
+    {
+        acceptedFirstCue_ = false;
+        buffered_.clear();
+        return fixture_.prepare(configuration);
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
+    accept(const AudioWindow &audio) override
+    {
+        auto accepted = fixture_.accept(audio);
+        if (!accepted) {
+            return accepted.error();
+        }
+        if (!acceptedFirstCue_) {
+            acceptedFirstCue_ = true;
+            return accepted.takeValue();
+        }
+        for (auto &batch : accepted.value()) {
+            buffered_.push_back(std::move(batch));
+        }
+        return std::vector<AsrTimelineBatch>{};
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
+    {
+        auto tail = fixture_.flush();
+        if (!tail) {
+            return tail.error();
+        }
+        for (auto &batch : tail.value()) {
+            buffered_.push_back(std::move(batch));
+        }
+        auto result = std::move(buffered_);
+        buffered_.clear();
+        return result;
+    }
+
+private:
+    bool acceptedFirstCue_{};
+    std::vector<AsrTimelineBatch> buffered_;
+    SpeakerFixtureAsrBackend fixture_;
+};
+
+class WrongSourceFixtureAsrBackend final : public IAsrBackend {
+public:
+    [[nodiscard]] BackendInfo info() const override
+    {
+        return BackendInfo{"fixture-wrong-source", "1", true};
+    }
+
+    [[nodiscard]] Expected<void>
+    prepare(const AsrConfiguration &configuration) override
+    {
+        return fixture_.prepare(configuration);
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
+    accept(const AudioWindow &audio) override
+    {
+        auto accepted = fixture_.accept(audio);
+        if (!accepted) {
+            return accepted.error();
+        }
+        const auto wrongSourceId = audio.sourceId == 1 ? 2 : 1;
+        for (auto &batch : accepted.value()) {
+            batch.sourceId = wrongSourceId;
+            for (auto &hypothesis : batch.hypotheses) {
+                hypothesis.sourceId = wrongSourceId;
+            }
+        }
+        return accepted.takeValue();
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
+    {
+        return fixture_.flush();
+    }
+
+private:
+    FixtureAsrBackend fixture_;
+};
+
+class OutOfRangeTimestampFixtureAsrBackend final : public IAsrBackend {
+public:
+    [[nodiscard]] BackendInfo info() const override
+    {
+        return BackendInfo{"fixture-out-of-range-timestamp", "1", true};
+    }
+
+    [[nodiscard]] Expected<void>
+    prepare(const AsrConfiguration &configuration) override
+    {
+        return fixture_.prepare(configuration);
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
+    accept(const AudioWindow &audio) override
+    {
+        auto accepted = fixture_.accept(audio);
+        if (!accepted) {
+            return accepted.error();
+        }
+        for (auto &batch : accepted.value()) {
+            for (auto &hypothesis : batch.hypotheses) {
+                hypothesis.endTimeNs = batch.finalizedThroughTimeNs
+                        == std::numeric_limits<std::int64_t>::max()
+                    ? batch.finalizedThroughTimeNs
+                    : batch.finalizedThroughTimeNs + 1;
+            }
+        }
+        return accepted.takeValue();
+    }
+
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
+    {
+        return fixture_.flush();
+    }
+
+private:
+    FixtureAsrBackend fixture_;
+};
+
 class FailingFixtureAsrBackend final : public IAsrBackend {
 public:
     FailingFixtureAsrBackend(std::string id, bool throws)
@@ -193,7 +493,7 @@ public:
         return success();
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>>
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
     accept(const AudioWindow &) override
     {
         if (!prepared_) {
@@ -210,12 +510,12 @@ public:
         return Error{LS_BACKEND_FAILURE, "injected fixture ASR failure"};
     }
 
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>> flush() override
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override
     {
         if (!prepared_) {
             return Error{LS_INVALID_STATE, "failing fixture is not prepared"};
         }
-        return std::vector<AsrHypothesis>{};
+        return std::vector<AsrTimelineBatch>{};
     }
 
 private:
@@ -239,85 +539,128 @@ FixtureAsrBackend::prepare(const AsrConfiguration &configuration)
     return success();
 }
 
-Expected<std::vector<AsrHypothesis>>
+Expected<std::vector<AsrTimelineBatch>>
 FixtureAsrBackend::accept(const AudioWindow &audio)
 {
     if (!prepared_) {
         return Error{LS_INVALID_STATE, "fixture ASR is not prepared"};
     }
-    if (audio.samples.empty()) {
-        return std::vector<AsrHypothesis>{};
-    }
+    AsrTimelineBatch batch;
+    batch.sourceId = audio.sourceId;
+    batch.processedStartTimeNs = audio.monotonicTimeNs;
+    batch.finalizedThroughTimeNs = saturatedAdd(
+        audio.monotonicTimeNs,
+        durationNs(audio));
+    batch.discontinuityBefore =
+        (audio.flags & LS_AUDIO_FLAG_DISCONTINUITY) != 0;
 
-    const auto peak = std::max_element(
-        audio.samples.begin(),
-        audio.samples.end(),
-        [](float left, float right) {
-            return std::fabs(left) < std::fabs(right);
-        });
-    if (peak == audio.samples.end() || std::fabs(*peak) < 0.001F) {
-        return std::vector<AsrHypothesis>{};
+    if (audio.samples.empty()) {
+        return std::vector<AsrTimelineBatch>{std::move(batch)};
     }
 
     /*
      * Fixture encoding (test-only and deliberately simple):
-     *   abs(first sample) * 1000 -> cue ID, zero -> sequence number
-     *   negative first sample   -> revision 2
-     * A frame produces at most one final. No production backend can be
-     * selected through this path without the explicit core test flag.
+     *   abs(first callback sample) * 1000 -> cue ID
+     *   zero first sample                    -> callback sequence number
+     *   negative first sample                -> revision 2
+     * A callback produces at most one final. Runtime may aggregate equal-
+     * sized callbacks, so the fixture preserves those logical boundaries.
+     * No production backend can be selected through this path without the
+     * explicit core test flag.
      */
-    const float first = audio.samples.front();
-    const auto encoded = static_cast<std::uint64_t>(
-        std::llround(std::fabs(static_cast<double>(first)) * 1000.0));
-    const std::uint64_t cueId =
-        encoded == 0 ? audio.sequenceNumber : encoded;
-    const std::uint32_t revision = first < 0.0F ? 2u : 1u;
+    for (const auto &slice : fixtureCallbackSlices(audio)) {
+        if (!fixtureSliceHasSignal(audio, slice)) {
+            continue;
+        }
+        const float first = audio.samples[slice.sampleOffset];
+        const auto encoded = static_cast<std::uint64_t>(
+            std::llround(std::fabs(static_cast<double>(first)) * 1000.0));
+        const std::uint64_t cueId =
+            encoded == 0 ? slice.sequenceNumber : encoded;
+        const std::uint32_t revision = first < 0.0F ? 2u : 1u;
 
-    std::string language;
-    switch (configuration_.languageMode) {
-    case LS_LANGUAGE_MODE_RUSSIAN:
-        language = "ru";
-        break;
-    case LS_LANGUAGE_MODE_ENGLISH:
-        language = "en";
-        break;
-    case LS_LANGUAGE_MODE_RUSSIAN_ENGLISH:
-        language = cueId % 2 == 0 ? "en" : "ru";
-        break;
-    default:
-        language = "und";
-        break;
+        std::string language;
+        switch (configuration_.languageMode) {
+        case LS_LANGUAGE_MODE_RUSSIAN:
+            language = "ru";
+            break;
+        case LS_LANGUAGE_MODE_ENGLISH:
+            language = "en";
+            break;
+        case LS_LANGUAGE_MODE_RUSSIAN_ENGLISH:
+            language = cueId % 2 == 0 ? "en" : "ru";
+            break;
+        default:
+            language = "und";
+            break;
+        }
+
+        AsrHypothesis hypothesis;
+        hypothesis.stableId = fixtureStableId(audio.sourceId, cueId);
+        hypothesis.sourceId = audio.sourceId;
+        hypothesis.startTimeNs = slice.startTimeNs;
+        hypothesis.endTimeNs = slice.endTimeNs;
+        hypothesis.text = "fixture cue " + std::to_string(cueId);
+        if (revision > 1) {
+            hypothesis.text += " revised";
+        }
+        hypothesis.language = std::move(language);
+        hypothesis.confidence = revision > 1 ? 0.99F : 0.95F;
+        hypothesis.revision = revision;
+        hypothesis.final = true;
+
+        batch.hypotheses.push_back(std::move(hypothesis));
     }
-
-    AsrHypothesis hypothesis;
-    hypothesis.stableId = fixtureStableId(audio.sourceId, cueId);
-    hypothesis.sourceId = audio.sourceId;
-    hypothesis.startTimeNs = audio.monotonicTimeNs;
-    hypothesis.endTimeNs =
-        saturatedAdd(audio.monotonicTimeNs, durationNs(audio));
-    hypothesis.text = "fixture cue " + std::to_string(cueId);
-    if (revision > 1) {
-        hypothesis.text += " revised";
-    }
-    hypothesis.language = std::move(language);
-    hypothesis.confidence = revision > 1 ? 0.99F : 0.95F;
-    hypothesis.revision = revision;
-    hypothesis.final = true;
-
-    return std::vector<AsrHypothesis>{std::move(hypothesis)};
+    return std::vector<AsrTimelineBatch>{std::move(batch)};
 }
 
-Expected<std::vector<AsrHypothesis>> FixtureAsrBackend::flush()
+Expected<std::vector<AsrTimelineBatch>> FixtureAsrBackend::flush()
 {
     if (!prepared_) {
         return Error{LS_INVALID_STATE, "fixture ASR is not prepared"};
     }
-    return std::vector<AsrHypothesis>{};
+    return std::vector<AsrTimelineBatch>{};
 }
 
 Expected<std::unique_ptr<IAsrBackend>>
 createAsrBackend(std::string_view backendId, bool allowTestBackends)
 {
+    if (backendId == "fixture-speakers-buffered") {
+        if (!allowTestBackends) {
+            return Error{
+                LS_BACKEND_UNAVAILABLE,
+                "buffered speaker fixture backend requires explicit test configuration"};
+        }
+        return std::unique_ptr<IAsrBackend>(
+            std::make_unique<BufferedSpeakerFixtureAsrBackend>());
+    }
+    if (backendId == "fixture-wrong-source") {
+        if (!allowTestBackends) {
+            return Error{
+                LS_BACKEND_UNAVAILABLE,
+                "wrong-source fixture backend requires explicit test configuration"};
+        }
+        return std::unique_ptr<IAsrBackend>(
+            std::make_unique<WrongSourceFixtureAsrBackend>());
+    }
+    if (backendId == "fixture-out-of-range-timestamp") {
+        if (!allowTestBackends) {
+            return Error{
+                LS_BACKEND_UNAVAILABLE,
+                "out-of-range timestamp fixture backend requires explicit test configuration"};
+        }
+        return std::unique_ptr<IAsrBackend>(
+            std::make_unique<OutOfRangeTimestampFixtureAsrBackend>());
+    }
+    if (backendId == "fixture-speakers") {
+        if (!allowTestBackends) {
+            return Error{
+                LS_BACKEND_UNAVAILABLE,
+                "speaker fixture backend requires explicit test configuration"};
+        }
+        return std::unique_ptr<IAsrBackend>(
+            std::make_unique<SpeakerFixtureAsrBackend>());
+    }
     if (backendId == "fixture") {
         if (!allowTestBackends) {
             return Error{

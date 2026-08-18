@@ -13,6 +13,7 @@ struct WhisperChunk {
     std::uint64_t sourceId{};
     std::int64_t startTimeNs{};
     std::uint64_t ordinal{};
+    bool discontinuityBefore{};
     std::vector<float> samples;
 };
 
@@ -50,6 +51,9 @@ public:
                 pending = Pending{};
             }
         }
+        if (discontinuity) {
+            pending.discontinuityBefore = true;
+        }
         if (pending.samples.empty() && !samples.empty()) {
             pending.startTimeNs = startTimeNs;
             pending.ordinal = nextOrdinal_++;
@@ -64,6 +68,23 @@ public:
         }
         if (endOfStream && !pending.samples.empty()) {
             ready.push_back(takeAll(sourceId, pending));
+        }
+        const bool emittedBoundary = std::any_of(
+            ready.begin(),
+            ready.end(),
+            [](const WhisperChunk &chunk) {
+                return chunk.discontinuityBefore;
+            });
+        if (discontinuity && !emittedBoundary) {
+            WhisperChunk marker;
+            marker.sourceId = sourceId;
+            marker.startTimeNs = startTimeNs;
+            marker.ordinal = pending.ordinal;
+            marker.discontinuityBefore = true;
+            ready.push_back(std::move(marker));
+            /* The marker consumes the boundary before buffered post-gap
+               samples are eventually decoded. */
+            pending.discontinuityBefore = false;
         }
         if (endOfStream && pending.samples.empty()) {
             pending_.erase(sourceId);
@@ -102,6 +123,7 @@ private:
         std::int64_t startTimeNs{};
         std::vector<float> samples;
         std::uint64_t ordinal{};
+        bool discontinuityBefore{};
     };
 
     [[nodiscard]] WhisperChunk takePrefix(
@@ -113,6 +135,7 @@ private:
         chunk.sourceId = sourceId;
         chunk.startTimeNs = pending.startTimeNs;
         chunk.ordinal = pending.ordinal;
+        chunk.discontinuityBefore = pending.discontinuityBefore;
         chunk.samples.assign(
             pending.samples.begin(),
             pending.samples.begin() + static_cast<std::ptrdiff_t>(count));
@@ -122,6 +145,7 @@ private:
         pending.startTimeNs += static_cast<std::int64_t>(
             count * 1'000'000'000ULL / sampleRate_);
         pending.ordinal = nextOrdinal_++;
+        pending.discontinuityBefore = false;
         return chunk;
     }
 
@@ -132,6 +156,7 @@ private:
         chunk.sourceId = sourceId;
         chunk.startTimeNs = pending.startTimeNs;
         chunk.ordinal = pending.ordinal;
+        chunk.discontinuityBefore = pending.discontinuityBefore;
         chunk.samples = std::move(pending.samples);
         pending = Pending{};
         return chunk;

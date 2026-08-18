@@ -9,9 +9,9 @@ public:
     [[nodiscard]] BackendInfo info() const override;
     [[nodiscard]] Expected<void>
     prepare(const AsrConfiguration &configuration) override;
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>>
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>>
     accept(const AudioWindow &audio) override;
-    [[nodiscard]] Expected<std::vector<AsrHypothesis>> flush() override;
+    [[nodiscard]] Expected<std::vector<AsrTimelineBatch>> flush() override;
 
 private:
     AsrConfiguration configuration_;
